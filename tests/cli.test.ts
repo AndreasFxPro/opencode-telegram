@@ -35,9 +35,9 @@ test("node create prints a single-command installer with the one-time token", as
   expect(exitCode).toBe(0)
   expect(output).toContain("Install and enroll machine-a:")
   expect(output).toContain(
-    "curl -fsSL 'https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/v0.3.0/install.sh' -o \"$installer\"",
+    "curl -fsSL 'https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/v0.3.1/install.sh' -o \"$installer\"",
   )
-  expect(output).toContain("OPENCODE_TELEGRAM_VERSION='v0.3.0' OPENCODE_TELEGRAM_ENROLLMENT_TOKEN='oct_join_")
+  expect(output).toContain("OPENCODE_TELEGRAM_VERSION='v0.3.1' OPENCODE_TELEGRAM_ENROLLMENT_TOKEN='oct_join_")
   expect(output).toContain("bash \"$installer\" setup node --hub 'https://hub.example.com'")
   expect(output).not.toContain("--token")
 })
