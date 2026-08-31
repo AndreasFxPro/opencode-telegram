@@ -1,0 +1,62 @@
+{
+  "name": "opencode-telegram",
+  "version": "0.1.0",
+  "description": "A secure Telegram notification and approval companion for OpenCode TUI",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "opencode-telegram": "./dist/cli.js"
+  },
+  "exports": {
+    "./tui": {
+      "import": "./dist/opencode/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "opencode": ">=1.17.7 <2",
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "dev": "bun src/cli.ts standalone",
+    "dev:hub": "bun src/cli.ts hub",
+    "dev:node": "bun src/cli.ts node",
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "test": "bun test",
+    "test:integration": "bun test tests/integration",
+    "test:e2e": "bun test tests/e2e/real-opencode.test.ts",
+    "package:smoke": "bun run scripts/package-smoke.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.23",
+    "zod": "4.1.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.10",
+    "@opentui/core": "0.4.5",
+    "@opentui/keymap": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "@types/bun": "1.4.0",
+    "typescript": "5.9.2"
+  },
+  "keywords": [
+    "opencode",
+    "telegram",
+    "tui",
+    "approval",
+    "remote"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AndreasFxPro/opencode-telegram.git"
+  }
+}

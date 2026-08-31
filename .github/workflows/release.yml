@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun test && bun run typecheck && bun run lint
+      - run: mkdir -p release
+      - run: bun build src/cli.ts --compile --target=bun-linux-x64 --outfile release/opencode-telegram-linux-x64
+      - run: bun build src/cli.ts --compile --target=bun-linux-arm64 --outfile release/opencode-telegram-linux-arm64
+      - run: bun build src/cli.ts --compile --target=bun-darwin-x64 --outfile release/opencode-telegram-darwin-x64
+      - run: bun build src/cli.ts --compile --target=bun-darwin-arm64 --outfile release/opencode-telegram-darwin-arm64
+      - run: bun build src/opencode/tui.ts --target=bun --format=esm --external @opencode-ai/plugin/tui --external @opencode-ai/sdk/v2 --outfile release/opencode-telegram-tui.js
+      - run: cd release && sha256sum opencode-telegram-* > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

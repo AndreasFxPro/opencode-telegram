@@ -1,0 +1,11 @@
+.agent/
+.env
+*.db
+*.db-shm
+*.db-wal
+dist/
+node_modules/
+coverage/
+release/
+config.json
+secrets.json

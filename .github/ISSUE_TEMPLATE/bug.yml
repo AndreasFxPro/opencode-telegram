@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible defect without secrets or private project data
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not report security vulnerabilities here. Use a private GitHub Security Advisory.
+  - type: input
+    id: version
+    attributes:
+      label: opencode-telegram version
+    validations:
+      required: true
+  - type: input
+    id: opencode
+    attributes:
+      label: OpenCode version
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [standalone, hub, node, TUI plugin]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Redact credentials, prompts, paths, and source content.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Redacted doctor output

@@ -1,0 +1,30 @@
+{
+  "mode": "standalone",
+  "hub": {
+    "listen": "127.0.0.1:47620",
+    "publicUrl": "http://127.0.0.1:47620"
+  },
+  "node": {
+    "name": "my-laptop",
+    "hubUrl": "ws://127.0.0.1:47620/v1/node/ws",
+    "allowInsecureHub": false,
+    "localListen": "127.0.0.1:47621"
+  },
+  "telegram": {
+    "authorizedChats": [{ "id": 123456789, "role": "owner" }],
+    "authorizedUsers": [{ "id": 123456789, "role": "owner" }]
+  },
+  "features": { "remotePrompt": false },
+  "notifications": {
+    "permission": true,
+    "question": true,
+    "error": true,
+    "done": { "enabled": true, "minimumDurationSeconds": 20 },
+    "includeBranch": true,
+    "includeTmux": true,
+    "includeModel": true,
+    "includeAgent": true,
+    "includeFinalPreview": false,
+    "previewMaxChars": 180
+  }
+}
