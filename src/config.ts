@@ -51,6 +51,7 @@ export const ConfigSchema = z.object({
       permission: z.boolean().default(true),
       question: z.boolean().default(true),
       error: z.boolean().default(true),
+      nodeJoin: z.boolean().default(true),
       done: z
         .object({ enabled: z.boolean().default(true), minimumDurationSeconds: z.number().min(0).default(20) })
         .default({
@@ -68,6 +69,7 @@ export const ConfigSchema = z.object({
       permission: true,
       question: true,
       error: true,
+      nodeJoin: true,
       done: { enabled: true, minimumDurationSeconds: 20 },
       includeBranch: true,
       includeTmux: true,

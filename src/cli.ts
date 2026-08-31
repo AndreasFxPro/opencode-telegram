@@ -21,6 +21,7 @@ import { MIN_OPENCODE_VERSION, PROTOCOL_VERSION, VERSION } from "./version.ts"
 
 const args = process.argv.slice(2)
 const command = args[0] ?? "help"
+const INSTALL_SCRIPT_URL = `https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/v${VERSION}/install.sh`
 
 function option(name: string) {
   const index = args.indexOf(name)
@@ -147,6 +148,7 @@ async function setup() {
   const localPluginSecret = randomId("local", 32)
   let nodeId = randomId("node")
   let nodeCredential: string | undefined
+  let enrolledNodeName: string | undefined
   let telegramBotToken: string | undefined
   let authorizedChats: Array<{ id: number; role: "owner" }> = []
   let authorizedUsers: Array<{ id: number; role: "owner" }> = []
@@ -181,7 +183,8 @@ async function setup() {
   }
 
   if (mode === "node") {
-    const enrollmentToken = option("--token") ?? (await input("Enrollment token"))
+    const enrollmentToken =
+      option("--token") ?? process.env.OPENCODE_TELEGRAM_ENROLLMENT_TOKEN ?? (await input("Enrollment token"))
     if (!enrollmentToken) throw new Error("Enrollment token is required")
     hubUrl = option("--hub") ?? (await input("Hub URL"))
     if (!hubUrl) throw new Error("Hub URL is required")
@@ -196,6 +199,7 @@ async function setup() {
     const enrolled = (await response.json()) as { nodeId: string; credential: string; nodeName: string }
     nodeId = enrolled.nodeId
     nodeCredential = enrolled.credential
+    enrolledNodeName = enrolled.nodeName
   }
 
   if (mode === "standalone") nodeCredential = randomId("oct_node", 32)
@@ -206,7 +210,7 @@ async function setup() {
     mode,
     hub: { listen: option("--listen") ?? "127.0.0.1:47620", publicUrl: hubUrl },
     node: {
-      name: option("--name") ?? hostname(),
+      name: option("--name") ?? enrolledNodeName ?? hostname(),
       hubUrl: wsUrl,
       allowInsecureHub: has("--allow-insecure-hub"),
       localListen: "127.0.0.1:47621",
@@ -275,6 +279,16 @@ async function nodeAdmin() {
       if (!name) throw new Error("Node name is required")
       const enrollment = store.createEnrollment(name)
       console.log(`Enrollment token:\n${enrollment.token}\n\nExpires: ${new Date(enrollment.expiresAt).toISOString()}`)
+      const hubUrl = loadConfig().hub.publicUrl
+      if (hubUrl) {
+        try {
+          requireSecureRemote(hubUrl)
+          const installCommand = `(installer="$(mktemp)" && trap 'rm -f "$installer"' EXIT && curl -fsSL ${shellQuote(INSTALL_SCRIPT_URL)} -o "$installer" && OPENCODE_TELEGRAM_VERSION=${shellQuote(`v${VERSION}`)} OPENCODE_TELEGRAM_ENROLLMENT_TOKEN=${shellQuote(enrollment.token)} bash "$installer" setup node --hub ${shellQuote(hubUrl)})`
+          console.log(`\nInstall and enroll ${name}:\n${installCommand}`)
+        } catch (error) {
+          console.log(`\nInstall command unavailable: ${String(error)}`)
+        }
+      }
       return
     }
     if (operation === "list") {
@@ -400,6 +414,10 @@ function systemdQuote(value: string) {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
 }
 
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
 function servicePath() {
   if (platform() === "darwin") return join(homedir(), "Library", "LaunchAgents", "dev.opencode.telegram.plist")
   return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "systemd", "user", "opencode-telegram.service")
@@ -432,13 +450,15 @@ function serviceInstall() {
 }
 
 function serviceCommand(operation: string) {
+  let result: ReturnType<typeof run> | undefined
   if (platform() === "darwin") {
     const domain = `gui/${process.getuid?.() ?? 0}`
-    if (operation === "status") run("launchctl", ["print", `${domain}/dev.opencode.telegram`])
-    else if (operation === "restart") run("launchctl", ["kickstart", "-k", `${domain}/dev.opencode.telegram`])
-    else if (operation === "start") run("launchctl", ["kickstart", `${domain}/dev.opencode.telegram`])
-    else if (operation === "stop") run("launchctl", ["kill", "SIGTERM", `${domain}/dev.opencode.telegram`])
-  } else run("systemctl", ["--user", operation, "opencode-telegram.service"])
+    if (operation === "status") result = run("launchctl", ["print", `${domain}/dev.opencode.telegram`])
+    else if (operation === "restart") result = run("launchctl", ["kickstart", "-k", `${domain}/dev.opencode.telegram`])
+    else if (operation === "start") result = run("launchctl", ["kickstart", `${domain}/dev.opencode.telegram`])
+    else if (operation === "stop") result = run("launchctl", ["kill", "SIGTERM", `${domain}/dev.opencode.telegram`])
+  } else result = run("systemctl", ["--user", operation, "opencode-telegram.service"])
+  if (!result?.success) throw new Error(`Service ${operation} failed`)
 }
 
 function help() {
@@ -480,13 +500,16 @@ async function main() {
   }
   if (command === "uninstall") {
     if (!has("--yes")) throw new Error("Refusing to remove configuration without --yes")
-    if (platform() === "darwin") run("launchctl", ["bootout", `gui/${process.getuid?.() ?? 0}`, servicePath()])
-    else {
-      serviceCommand("stop")
-      run("systemctl", ["--user", "disable", "opencode-telegram.service"])
-      run("systemctl", ["--user", "daemon-reload"])
+    const installedService = servicePath()
+    if (existsSync(installedService)) {
+      if (platform() === "darwin") run("launchctl", ["bootout", `gui/${process.getuid?.() ?? 0}`, installedService])
+      else {
+        run("systemctl", ["--user", "stop", "opencode-telegram.service"])
+        run("systemctl", ["--user", "disable", "opencode-telegram.service"])
+      }
+      rmSync(installedService)
+      if (platform() !== "darwin") run("systemctl", ["--user", "daemon-reload"])
     }
-    if (existsSync(servicePath())) rmSync(servicePath())
     rmSync(configPath, { force: true })
     rmSync(secretPath, { force: true })
     return console.log(

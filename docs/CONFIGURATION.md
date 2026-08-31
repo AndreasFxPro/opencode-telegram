@@ -29,6 +29,7 @@ See [`config.example.json`](../config.example.json). `secrets.json` is generated
 ## Notification Defaults
 
 - Permission, question, and errors: enabled.
+- First authenticated node connection notifications: enabled.
 - Completion: enabled after 20 seconds.
 - Root sessions only for completion.
 - Branch/model/agent metadata: enabled when natively available.

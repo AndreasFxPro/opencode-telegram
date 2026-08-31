@@ -53,10 +53,15 @@ test("fake Telegram callback dispatches one opaque action for an authorized appr
   const gateway = new TelegramGateway(config, "123456789:abcdefghijklmnopqrstuvwxyz", store, hub)
   cleanup.push(() => gateway.stop())
   await gateway.validate()
+  expect(await gateway.notifyNodeJoined("node-joined-123456789", "<build&node>")).toBe(1)
+  const joined = calls.find((call) => call.method === "sendMessage" && String(call.body.text).includes("Node joined"))
+  expect(joined?.body.text).toContain("&lt;build&amp;node&gt;")
+  expect(joined?.body.text).not.toContain("<build&node>")
   await gateway.notifyPending(row)
-  const sent = calls.find((call) => call.method === "sendMessage")
+  const sent = calls.find((call) => call.method === "sendMessage" && call.body.reply_markup)
   const keyboard = sent?.body.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }
   const callbackData = keyboard.inline_keyboard[0]?.[0]?.callback_data
+  const pendingMessageId = store.telegramMessages(row.identity)[0]?.message_id
   expect(callbackData?.length).toBeLessThanOrEqual(64)
   updates.push({
     update_id: 1,
@@ -64,7 +69,7 @@ test("fake Telegram callback dispatches one opaque action for an authorized appr
       id: "callback-1",
       data: callbackData,
       from: { id: 42 },
-      message: { message_id: 100, chat: { id: 42 } },
+      message: { message_id: pendingMessageId, chat: { id: 42 } },
     },
   })
   gateway.start()
@@ -76,7 +81,7 @@ test("fake Telegram callback dispatches one opaque action for an authorized appr
       id: "callback-2",
       data: callbackData,
       from: { id: 99 },
-      message: { message_id: 100, chat: { id: 99 } },
+      message: { message_id: pendingMessageId, chat: { id: 99 } },
     },
   })
   await Bun.sleep(100)

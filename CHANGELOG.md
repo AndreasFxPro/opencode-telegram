@@ -4,6 +4,14 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-31
+
+### Added
+
+- Telegram notifications for a node's first authenticated connection.
+- Hub-generated one-command node installation and enrollment.
+- Persistent, step-by-step install logs and automatic active-service restart during updates.
+
 ## [0.1.0] - 2026-08-26
 
 ### Added

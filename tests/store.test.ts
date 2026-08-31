@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { join } from "node:path"
 import { HubStore, NodeStore } from "../src/store.ts"
@@ -15,11 +16,16 @@ describe("hub persistence and idempotency", () => {
     const store = new HubStore(join(temp.path, "hub.db"))
     const enrollment = store.createEnrollment("machine-a")
     const node = store.exchangeEnrollment(enrollment.token)
+    if (!node) throw new Error("Enrollment failed")
     expect(node?.nodeName).toBe("machine-a")
     expect(store.exchangeEnrollment(enrollment.token)).toBeUndefined()
     expect(store.authenticateNode(node?.nodeId ?? "", node?.credential ?? "")).toBeTrue()
-    store.revokeNode(node?.nodeId ?? "")
-    expect(store.authenticateNode(node?.nodeId ?? "", node?.credential ?? "")).toBeFalse()
+    expect(store.connectNode(node.nodeId)).toEqual({ nodeId: node.nodeId, nodeName: "machine-a" })
+    expect(store.connectNode(node.nodeId)).toEqual({ nodeId: node.nodeId, nodeName: "machine-a" })
+    store.markNodeJoinNotified(node.nodeId)
+    expect(store.connectNode(node.nodeId)).toBeUndefined()
+    store.revokeNode(node.nodeId)
+    expect(store.authenticateNode(node.nodeId, node.credential)).toBeFalse()
     store.close()
   })
 
@@ -34,6 +40,21 @@ describe("hub persistence and idempotency", () => {
     const second = new HubStore(path)
     expect(second.acceptEvent("node-a", "generation-a", 1, event)).toBeFalse()
     second.close()
+  })
+
+  test("migrates existing nodes without replaying join notifications", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const path = join(temp.path, "hub.db")
+    const legacy = new Database(path, { create: true })
+    legacy.exec(
+      "CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT NOT NULL, credential_hash TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_seen INTEGER)",
+    )
+    legacy.query("INSERT INTO nodes VALUES(?,?,?,?,?,?)").run("node-existing", "existing", "hash", 0, 1, 2)
+    legacy.close()
+    const store = new HubStore(path)
+    expect(store.connectNode("node-existing")).toBeUndefined()
+    store.close()
   })
 
   test("allows only one in-flight action for a pending request", () => {

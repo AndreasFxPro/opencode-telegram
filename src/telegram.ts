@@ -224,6 +224,27 @@ export class TelegramGateway {
     }
   }
 
+  async notifyNodeJoined(nodeId: string, nodeName: string) {
+    const text = `🖥 <b>Node joined</b>\n\nName: <code>${escapeHtml(clip(nodeName, 100))}</code>\nID: <code>${escapeHtml(nodeId.slice(0, 16))}</code>`
+    let sent = 0
+    for (const auth of this.config.telegram.authorizedChats) {
+      if (this.store.isMuted("chat", String(auth.id))) continue
+      try {
+        await this.api("sendMessage", {
+          chat_id: auth.id,
+          ...(auth.threadId ? { message_thread_id: auth.threadId } : {}),
+          text,
+          parse_mode: "HTML",
+          disable_notification: false,
+        })
+        sent++
+      } catch (error) {
+        this.log.warn("node join notification failed", { chat: auth.id, error })
+      }
+    }
+    return sent
+  }
+
   async notifyExecution(event: BridgeEvent) {
     event = this.visibleEvent(event)
     if (

@@ -13,6 +13,38 @@ opencode-telegram setup
 
 The release installer writes no credentials. Setup creates them later.
 
+## Single Command
+
+The installer passes arguments after `bash -s --` to the installed CLI and uses the controlling terminal for interactive prompts:
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/main/install.sh | bash -s -- setup'
+```
+
+On a configured hub, `opencode-telegram node create <name>` prints a complete single-use command that installs and enrolls that node. Treat the command as a temporary secret because it contains the 15-minute, single-use enrollment token and may be retained in shell history.
+
+## Install Log
+
+Each platform check, download, checksum, destination, setup invocation, and service restart is printed and appended to:
+
+```text
+~/.local/state/opencode-telegram/install.log
+```
+
+The default state directory is `0700` and the log is always `0600`. Override the path with `OPENCODE_TELEGRAM_INSTALL_LOG`.
+
+## Update
+
+Rerun the installer without setup arguments:
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/main/install.sh | bash'
+```
+
+Configuration and secrets are retained. Release files are checksum-verified and each file is atomically replaced. If the service is active, the installer restarts it. Restart existing OpenCode TUIs to load the new TUI plugin bundle.
+
+Set `OPENCODE_TELEGRAM_RESTART_SERVICE=never` to replace files without restarting an active service.
+
 ## Source
 
 ```bash

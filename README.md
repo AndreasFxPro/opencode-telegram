@@ -40,9 +40,10 @@ opencode-telegram setup
 Convenience form:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/main/install.sh | bash
-opencode-telegram setup
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/main/install.sh | bash -s -- setup'
 ```
+
+The installer prints each verification and installation step and appends the same output to `~/.local/state/opencode-telegram/install.log` with `0600` permissions.
 
 From source:
 
@@ -69,7 +70,9 @@ opencode-telegram setup hub --hub https://opencode.example.com
 opencode-telegram node create workstation-01
 ```
 
-On a node:
+`node create` prints a single-use install command. Run that generated command on the node; it downloads the verified release, enrolls the node, and configures the OpenCode plugin in one invocation. The node's first authenticated connection sends a Telegram notification.
+
+Manual equivalent on a node:
 
 ```bash
 opencode-telegram setup node \
@@ -79,6 +82,16 @@ opencode-telegram service install
 ```
 
 Non-loopback nodes require `wss://` unless the explicit development-only `--allow-insecure-hub` option is used. Nodes need no inbound public port.
+
+## Updates
+
+Rerun the installer. It retains configuration and secrets, verifies and atomically replaces each release file, and restarts an active service:
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/main/install.sh | bash'
+```
+
+Restart running OpenCode TUIs to load the updated plugin bundle. Review the persistent install log at `~/.local/state/opencode-telegram/install.log`.
 
 ## Telegram UX
 

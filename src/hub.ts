@@ -110,9 +110,8 @@ export class Hub implements HubView {
         if (!body || typeof body !== "object" || !("token" in body) || typeof body.token !== "string")
           return Response.json({ error: "token required" }, { status: 400 })
         const result = this.store.exchangeEnrollment(body.token)
-        return result
-          ? Response.json(result)
-          : Response.json({ error: "invalid, expired, revoked, or used token" }, { status: 403 })
+        if (!result) return Response.json({ error: "invalid, expired, revoked, or used token" }, { status: 403 })
+        return Response.json(result)
       } catch {
         return Response.json({ error: "invalid JSON" }, { status: 400 })
       }
@@ -133,7 +132,16 @@ export class Hub implements HubView {
     const previous = this.sockets.get(socket.data.nodeId)
     previous?.close(4001, "Replaced by newer node connection")
     this.sockets.set(socket.data.nodeId, socket)
-    this.store.touchNode(socket.data.nodeId)
+    const joined = this.store.connectNode(socket.data.nodeId)
+    if (joined && this.config.notifications.nodeJoin && this.telegram)
+      void this.telegram
+        .notifyNodeJoined(joined.nodeId, joined.nodeName)
+        .then((sent) => {
+          if (sent > 0) this.store.markNodeJoinNotified(joined.nodeId)
+        })
+        .catch((error) => {
+          this.log.warn("node join notification failed", { node: joined.nodeId, error })
+        })
     this.log.info("node connected", { node: socket.data.nodeId })
   }
 

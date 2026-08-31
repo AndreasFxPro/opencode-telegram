@@ -54,7 +54,8 @@ export class HubStore {
       INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1'), ('telegram_offset', '0');
       CREATE TABLE IF NOT EXISTS nodes (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, credential_hash TEXT NOT NULL,
-        revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_seen INTEGER
+        revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_seen INTEGER,
+        connected_at INTEGER, join_notified_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS enrollments (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
@@ -97,6 +98,15 @@ export class HubStore {
         PRIMARY KEY(scope, scope_id)
       );
     `)
+    const nodeColumns = this.db.query("PRAGMA table_info(nodes)").all() as Array<{ name: string }>
+    if (!nodeColumns.some((column) => column.name === "connected_at")) {
+      this.db.exec("ALTER TABLE nodes ADD COLUMN connected_at INTEGER")
+      this.db.exec("UPDATE nodes SET connected_at=last_seen")
+    }
+    if (!nodeColumns.some((column) => column.name === "join_notified_at")) {
+      this.db.exec("ALTER TABLE nodes ADD COLUMN join_notified_at INTEGER")
+      this.db.exec("UPDATE nodes SET join_notified_at=last_seen")
+    }
   }
 
   close() {
@@ -156,6 +166,25 @@ export class HubStore {
 
   touchNode(nodeId: string) {
     this.db.query("UPDATE nodes SET last_seen=? WHERE id=?").run(Date.now(), nodeId)
+  }
+
+  connectNode(nodeId: string) {
+    const row = this.db
+      .query("SELECT name,revoked,connected_at,join_notified_at FROM nodes WHERE id=?")
+      .get(nodeId) as {
+      name: string
+      revoked: number
+      connected_at: number | null
+      join_notified_at: number | null
+    } | null
+    if (!row || row.revoked) return undefined
+    const now = Date.now()
+    this.db.query("UPDATE nodes SET last_seen=?,connected_at=COALESCE(connected_at,?) WHERE id=?").run(now, now, nodeId)
+    return row.join_notified_at === null ? { nodeId, nodeName: row.name } : undefined
+  }
+
+  markNodeJoinNotified(nodeId: string) {
+    this.db.query("UPDATE nodes SET join_notified_at=COALESCE(join_notified_at,?) WHERE id=?").run(Date.now(), nodeId)
   }
 
   listNodes() {
