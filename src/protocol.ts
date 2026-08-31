@@ -114,12 +114,58 @@ const TuiDisconnectedSchema = BaseEventSchema.extend({
   type: z.literal("tui.disconnected"),
 })
 
+const TelemetryTokensSchema = z.object({
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  reasoning: z.number().nonnegative(),
+  cacheRead: z.number().nonnegative(),
+  cacheWrite: z.number().nonnegative(),
+})
+
+export const TelemetryActivitySchema = z.object({
+  id: z.string().min(1).max(256),
+  type: z.enum(["thought", "tool", "text", "retry", "compaction"]),
+  title: z.string().max(256),
+  status: z.string().max(64).optional(),
+  detail: z.string().max(2400).optional(),
+  startedAt: z.number().int().nonnegative().optional(),
+  endedAt: z.number().int().nonnegative().optional(),
+})
+export type TelemetryActivity = z.infer<typeof TelemetryActivitySchema>
+
+export const SessionTelemetrySchema = z.object({
+  sessionId: z.string().min(1).max(256),
+  capture: z.enum(["metadata", "activity", "full"]),
+  parentId: z.string().max(256).optional(),
+  title: z.string().max(512).optional(),
+  status: z.enum(["idle", "busy", "retry", "unknown"]),
+  updatedAt: z.number().int().nonnegative(),
+  agent: z.string().max(256).optional(),
+  model: z.string().max(256).optional(),
+  provider: z.string().max(256).optional(),
+  cost: z.number().nonnegative(),
+  tokens: TelemetryTokensSchema,
+  todos: z
+    .array(
+      z.object({
+        content: z.string().max(1000),
+        status: z.string().max(64),
+        priority: z.string().max(64),
+      }),
+    )
+    .max(64),
+  activities: z.array(TelemetryActivitySchema).max(48),
+})
+export type SessionTelemetry = z.infer<typeof SessionTelemetrySchema>
+export const MAX_TELEMETRY_BATCH_BYTES = 384 * 1024
+
 const ReconcileSchema = BaseEventSchema.extend({
   type: z.literal("reconcile"),
   metadata: TuiMetadataSchema,
   pendingPermissions: z.array(PermissionSchema).max(256),
   pendingQuestions: z.array(QuestionAskedSchema).max(256),
   scopeSessionIds: z.array(z.string().max(256)).max(256),
+  telemetry: z.array(SessionTelemetrySchema).max(8).optional(),
 })
 
 export const BridgeEventSchema = z.discriminatedUnion("type", [
@@ -207,6 +253,7 @@ export const HubToNodeSchema = z.discriminatedUnion("type", [
     protocolVersion: z.literal(PROTOCOL_VERSION),
     heartbeatMs: z.number().int(),
     telegramReachable: z.boolean(),
+    telemetry: z.boolean().optional(),
   }),
   z.object({ type: z.literal("ack"), seq: z.number().int().positive() }),
   ActionDispatchSchema,

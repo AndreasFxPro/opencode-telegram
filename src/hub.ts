@@ -2,13 +2,46 @@ import { join } from "node:path"
 import type { Server, ServerWebSocket } from "bun"
 import type { Config, Secrets } from "./config.ts"
 import { dataDir, splitListen } from "./config.ts"
-import { type ActionDispatch, type BridgeEvent, HubToNodeSchema, NodeToHubSchema } from "./protocol.ts"
+import { dashboardApiHeaders, dashboardAsset } from "./dashboard.ts"
+import {
+  type ActionDispatch,
+  type BridgeEvent,
+  HubToNodeSchema,
+  NodeToHubSchema,
+  SessionTelemetrySchema,
+  TuiMetadataSchema,
+} from "./protocol.ts"
 import { HubStore, type PendingRow } from "./store.ts"
 import { type HubView, TelegramGateway } from "./telegram.ts"
-import { clip, createLogger } from "./util.ts"
+import { clip, createLogger, safeEqualHash, sha256 } from "./util.ts"
 import { PROTOCOL_VERSION } from "./version.ts"
 
 type SocketData = { nodeId: string }
+
+function json(value: string) {
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
+
+function dashboardUrl(config: Config) {
+  if (config.hub.publicUrl) return new URL(config.hub.publicUrl)
+  const listen = splitListen(config.hub.listen)
+  const hostname = listen.hostname.includes(":") ? `[${listen.hostname}]` : listen.hostname
+  return new URL(`http://${hostname}:${listen.port}`)
+}
+
+function requireSecureDashboard(config: Config) {
+  const url = dashboardUrl(config)
+  const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname.replace(/^\[|\]$/g, ""))
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    throw new Error(`Dashboard credentials require HTTPS for non-loopback URLs: ${url.origin}`)
+  const listener = splitListen(config.hub.listen)
+  if (!["localhost", "127.0.0.1", "::1"].includes(listener.hostname))
+    throw new Error("Dashboard listener must be loopback-only; expose it through an HTTPS reverse proxy")
+}
 
 export class Hub implements HubView {
   readonly store: HubStore
@@ -39,6 +72,13 @@ export class Hub implements HubView {
   }
 
   async start() {
+    if (this.config.dashboard.enabled && !this.secrets.dashboardToken)
+      throw new Error("Dashboard is enabled without a dashboard token")
+    if (this.config.dashboard.enabled) {
+      requireSecureDashboard(this.config)
+      this.store.cleanupTelemetry(Date.now(), this.config.dashboard.retentionHours * 60 * 60_000)
+    } else this.store.clearSessionTelemetry()
+    this.store.disconnectAllTuis()
     const listen = splitListen(this.config.hub.listen)
     this.server = Bun.serve<SocketData>({
       ...listen,
@@ -61,7 +101,7 @@ export class Hub implements HubView {
         }
       }, 10_000)
       const telegramUrl = new URL(this.config.telegram.apiBase)
-      const loopback = ["localhost", "127.0.0.1", "::1"].includes(telegramUrl.hostname)
+      const loopback = ["localhost", "127.0.0.1", "::1"].includes(telegramUrl.hostname.replace(/^\[|\]$/g, ""))
       if (telegramUrl.protocol !== "https:" && !loopback)
         throw new Error("Telegram API must use HTTPS unless it is a loopback development server")
       this.telegram = new TelegramGateway(this.config, this.secrets.telegramBotToken, this.store, this)
@@ -76,7 +116,8 @@ export class Hub implements HubView {
       this.telegram.start()
     }
     this.cleanupTimer = setInterval(() => {
-      for (const row of this.store.cleanup()) void this.telegram?.updatePending(row, "⌛ Request expired")
+      for (const row of this.store.cleanup(Date.now(), this.config.dashboard.retentionHours * 60 * 60_000))
+        void this.telegram?.updatePending(row, "⌛ Request expired")
     }, 60_000)
     this.log.info("listening", { address: this.config.hub.listen, telegram: Boolean(this.telegram) })
   }
@@ -93,13 +134,33 @@ export class Hub implements HubView {
 
   private async fetch(request: Request, server: Server<SocketData>) {
     const url = new URL(request.url)
+    if (this.config.dashboard.enabled) {
+      const asset = request.method === "GET" ? dashboardAsset(url.pathname) : undefined
+      if (asset) return asset
+      if (url.pathname === "/v1/dashboard/snapshot") {
+        if (request.method !== "GET")
+          return new Response("Method not allowed", {
+            status: 405,
+            headers: { allow: "GET", ...dashboardApiHeaders() },
+          })
+        if (!this.dashboardAuthenticated(request))
+          return Response.json(
+            { error: "Unauthorized" },
+            {
+              status: 401,
+              headers: { "www-authenticate": 'Bearer realm="opencode-telegram-dashboard"', ...dashboardApiHeaders() },
+            },
+          )
+        return Response.json(this.dashboardSnapshot(), { headers: dashboardApiHeaders() })
+      }
+    }
     if (url.pathname === "/health") {
       return Response.json({
         ok: true,
         protocolVersion: PROTOCOL_VERSION,
         uptimeMs: this.uptimeMs(),
         connectedNodes: this.sockets.size,
-        activeTuis: this.store.listTuis().filter((tui) => tui.connected).length,
+        activeTuis: this.store.activeTuiCount(),
         pending: this.store.listPending().length,
         telegram: Boolean(this.telegram),
       })
@@ -128,9 +189,76 @@ export class Hub implements HubView {
     return new Response("Not found", { status: 404 })
   }
 
+  private dashboardAuthenticated(request: Request) {
+    const authorization = request.headers.get("authorization") ?? ""
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : ""
+    return Boolean(token && this.secrets.dashboardToken && safeEqualHash(token, sha256(this.secrets.dashboardToken)))
+  }
+
+  dashboardSnapshot() {
+    const connectedNodeIds = new Set(this.connectedNodeIds())
+    const nodes = this.store.listNodes().map((node) => ({
+      id: node.id,
+      name: node.name,
+      connected: connectedNodeIds.has(node.id),
+      revoked: Boolean(node.revoked),
+      createdAt: node.created_at,
+      lastSeen: node.last_seen,
+    }))
+    const nodeNames = new Map(nodes.map((node) => [node.id, node.name]))
+    const telemetryRows = this.store.listSessionTelemetry(
+      Date.now() - this.config.dashboard.retentionHours * 60 * 60_000,
+    )
+    const tuis = new Map(
+      this.store.listTuis([...new Set(telemetryRows.map((row) => row.instance_id))]).flatMap((row) => {
+        const metadata = TuiMetadataSchema.safeParse(json(row.metadata_json))
+        return metadata.success
+          ? [[`${row.node_id}:${row.instance_id}`, { row, metadata: metadata.data }] as const]
+          : []
+      }),
+    )
+    const sessions = telemetryRows
+      .flatMap((row) => {
+        const parsed = SessionTelemetrySchema.safeParse(json(row.payload_json))
+        if (!parsed.success) return []
+        const tui = tuis.get(`${row.node_id}:${row.instance_id}`)
+        const telemetry = parsed.data
+        return [
+          {
+            key: `${row.node_id}:${row.session_id}`,
+            nodeId: row.node_id,
+            nodeName: nodeNames.get(row.node_id) ?? row.node_id.slice(0, 12),
+            instanceId: row.instance_id,
+            project: tui?.metadata.project ?? "unknown",
+            ...(telemetry.capture === "full" && tui?.metadata.directory ? { directory: tui.metadata.directory } : {}),
+            connected: Boolean(connectedNodeIds.has(row.node_id) && tui?.row.connected),
+            ...telemetry,
+          },
+        ]
+      })
+      .sort((left, right) => Number(right.connected) - Number(left.connected) || right.updatedAt - left.updatedAt)
+    const cost = sessions.reduce((total, session) => total + session.cost, 0)
+    return {
+      generatedAt: Date.now(),
+      protocolVersion: PROTOCOL_VERSION,
+      uptimeMs: this.uptimeMs(),
+      totals: {
+        nodes: nodes.length,
+        connectedNodes: connectedNodeIds.size,
+        sessions: sessions.length,
+        busy: sessions.filter((session) => session.connected && session.status === "busy").length,
+        pending: this.store.listPending().length,
+        cost,
+      },
+      nodes,
+      sessions,
+    }
+  }
+
   private open(socket: ServerWebSocket<SocketData>) {
     const previous = this.sockets.get(socket.data.nodeId)
     previous?.close(4001, "Replaced by newer node connection")
+    this.store.disconnectNodeTuis(socket.data.nodeId)
     this.sockets.set(socket.data.nodeId, socket)
     const joined = this.store.connectNode(socket.data.nodeId)
     if (joined && this.config.notifications.nodeJoin && this.telegram)
@@ -146,7 +274,10 @@ export class Hub implements HubView {
   }
 
   private close(socket: ServerWebSocket<SocketData>) {
-    if (this.sockets.get(socket.data.nodeId) === socket) this.sockets.delete(socket.data.nodeId)
+    if (this.sockets.get(socket.data.nodeId) === socket) {
+      this.sockets.delete(socket.data.nodeId)
+      this.store.disconnectNodeTuis(socket.data.nodeId)
+    }
     this.log.info("node disconnected", { node: socket.data.nodeId })
   }
 
@@ -175,6 +306,7 @@ export class Hub implements HubView {
   }
 
   private async message(socket: ServerWebSocket<SocketData>, raw: string | Buffer) {
+    if (this.sockets.get(socket.data.nodeId) !== socket) return
     if (!this.store.isNodeActive(socket.data.nodeId)) {
       socket.close(4003, "Node revoked")
       return
@@ -188,6 +320,7 @@ export class Hub implements HubView {
         protocolVersion: PROTOCOL_VERSION,
         heartbeatMs: 15_000,
         telegramReachable: Boolean(this.telegram),
+        telemetry: this.config.dashboard.enabled,
       })
       for (const row of this.store.dispatchingActionsForNode(socket.data.nodeId))
         this.send(socket, JSON.parse(row.payload_json))
@@ -205,7 +338,10 @@ export class Hub implements HubView {
     }
     if (!this.store.hasEvent(socket.data.nodeId, message.generation, message.seq)) {
       await this.handleEvent(socket.data.nodeId, message.event)
-      this.store.acceptEvent(socket.data.nodeId, message.generation, message.seq, message.event)
+      if (message.event.type === "reconcile") {
+        const { telemetry: _telemetry, ...storedEvent } = message.event
+        this.store.acceptEvent(socket.data.nodeId, message.generation, message.seq, storedEvent)
+      } else this.store.acceptEvent(socket.data.nodeId, message.generation, message.seq, message.event)
     }
     this.send(socket, { type: "ack", seq: message.seq })
   }
@@ -213,6 +349,9 @@ export class Hub implements HubView {
   private async handleEvent(nodeId: string, event: BridgeEvent) {
     if (event.type === "reconcile") {
       this.store.registerTui(nodeId, event.metadata)
+      if (this.config.dashboard.enabled)
+        for (const telemetry of event.telemetry ?? [])
+          this.store.upsertSessionTelemetry(nodeId, event.instanceId, telemetry)
       const active = new Set<string>()
       for (const pendingEvent of [...event.pendingPermissions, ...event.pendingQuestions]) {
         const result = this.store.upsertPending(nodeId, pendingEvent)

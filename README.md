@@ -83,6 +83,29 @@ opencode-telegram service install
 
 Non-loopback nodes require `wss://` unless the explicit development-only `--allow-insecure-hub` option is used. Nodes need no inbound public port.
 
+## Session Dashboard
+
+Enable the read-only dashboard on the hub and restart its service:
+
+```bash
+opencode-telegram dashboard enable
+opencode-telegram service restart
+```
+
+The command prints the dashboard URL and an independent `oct_dash_...` token. Remote dashboard URLs must use HTTPS; loopback HTTP remains available for local access. Open `/dashboard`, enter the token, and inspect live/recent sessions, status, model, agent, tokens, cache usage, cost, and bounded activity.
+
+Capture defaults to metadata. In a multi-host deployment, explicitly enable collection on each node. Select richer capture where needed, then restart the node service and OpenCode TUIs:
+
+```bash
+opencode-telegram dashboard enable           # on each node; does not host a dashboard
+opencode-telegram dashboard capture activity # thoughts, tool inputs/status, todos
+opencode-telegram dashboard capture full     # also prompts, responses, tool output, paths
+```
+
+The browser keeps the token only in memory. The dashboard has no prompt, shell, approval, or mutation endpoint. The hub listener must remain loopback-only and should be exposed through an HTTPS reverse proxy such as Tailscale Serve. Use `dashboard rotate`, `dashboard token`, or `dashboard disable` to administer access. Disabling deletes the token and stored telemetry; restart the hub promptly to invalidate its in-memory token and stop collection.
+
+In Telegram, send `/dashboard` or `/sessions` for the same read-only telemetry through inline session, activity, todo, refresh, and navigation buttons. Each view is bound to the initiating user, chat, topic, and bot message and expires after 30 minutes.
+
 ## Updates
 
 Rerun the installer. It retains configuration and secrets, verifies and atomically replaces each release file, and restarts an active service:
@@ -110,13 +133,14 @@ m androidboot
 
 `Always...` opens a second screen showing the exact OpenCode-proposed rule. Wildcards receive a prominent warning. Callback data contains only a compact opaque ID and operation code.
 
-Commands: `/start`, `/help`, `/status`, `/nodes`, `/sessions`, `/pending`, `/mute`, `/unmute`, `/whoami`.
+Commands: `/start`, `/help`, `/dashboard`, `/status`, `/nodes`, `/sessions`, `/pending`, `/mute`, `/unmute`, `/whoami`.
 
 OpenCode palette/slash commands: `/telegram-status`, `/telegram-test`, `/telegram-mute`.
 
 ## Security
 
 - Telegram actions cannot execute arbitrary commands or read arbitrary files.
+- The optional dashboard is read-only, independently authenticated, and metadata-only by default.
 - A callback can only resolve an existing, unexpired request bound to its original node, TUI, session, location, and request ID.
 - `Always` requires a second confirmation and is never broadened by the bridge.
 - Authorization roles are `viewer`, `approver`, and `owner`.

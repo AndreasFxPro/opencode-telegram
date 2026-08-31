@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite"
 import { chmodSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ActionDispatch, BridgeEvent, TuiMetadata } from "./protocol.ts"
+import type { ActionDispatch, BridgeEvent, SessionTelemetry, TuiMetadata } from "./protocol.ts"
 import { requestIdentity } from "./protocol.ts"
 import { randomId, safeEqualHash, sha256 } from "./util.ts"
 
@@ -36,6 +36,18 @@ export type ActionRow = {
   expires_at: number
 }
 
+export type SessionTelemetryRow = {
+  node_id: string
+  instance_id: string
+  session_id: string
+  payload_json: string
+  updated_at: number
+}
+
+const MAX_SESSION_TELEMETRY_ROWS = 128
+const MAX_SESSION_TELEMETRY_ROW_BYTES = 384 * 1024
+const MAX_SESSION_TELEMETRY_TOTAL_BYTES = 4 * 1024 * 1024
+
 export class HubStore {
   readonly db: Database
 
@@ -46,6 +58,7 @@ export class HubStore {
     chmodSync(path, 0o600)
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
     this.migrate()
+    this.pruneSessionTelemetry()
   }
 
   private migrate() {
@@ -69,6 +82,12 @@ export class HubStore {
         instance_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, metadata_json TEXT NOT NULL,
         connected INTEGER NOT NULL DEFAULT 1, last_seen INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_telemetry (
+        node_id TEXT NOT NULL, instance_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL, source_updated_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,
+        PRIMARY KEY(node_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS session_telemetry_updated_idx ON session_telemetry(updated_at);
       CREATE TABLE IF NOT EXISTS pending (
         identity TEXT PRIMARY KEY, node_id TEXT NOT NULL, instance_id TEXT NOT NULL,
         session_id TEXT NOT NULL, request_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -106,6 +125,13 @@ export class HubStore {
     if (!nodeColumns.some((column) => column.name === "join_notified_at")) {
       this.db.exec("ALTER TABLE nodes ADD COLUMN join_notified_at INTEGER")
       this.db.exec("UPDATE nodes SET join_notified_at=last_seen")
+    }
+    const telemetryColumns = this.db.query("PRAGMA table_info(session_telemetry)").all() as Array<{ name: string }>
+    if (!telemetryColumns.some((column) => column.name === "source_updated_at")) {
+      this.db.exec("ALTER TABLE session_telemetry ADD COLUMN source_updated_at INTEGER NOT NULL DEFAULT 0")
+      this.db.exec(
+        "UPDATE session_telemetry SET source_updated_at=COALESCE(CAST(json_extract(payload_json,'$.updatedAt') AS INTEGER),0)",
+      )
     }
   }
 
@@ -236,16 +262,89 @@ export class HubStore {
       .run(Date.now(), nodeId, instanceId)
   }
 
-  listTuis() {
+  disconnectNodeTuis(nodeId: string) {
+    this.db.query("UPDATE tuis SET connected=0,last_seen=? WHERE node_id=? AND connected=1").run(Date.now(), nodeId)
+  }
+
+  disconnectAllTuis() {
+    this.db.query("UPDATE tuis SET connected=0,last_seen=? WHERE connected=1").run(Date.now())
+  }
+
+  listTuis(instanceIds?: string[]) {
+    if (instanceIds?.length === 0) return []
+    const where = instanceIds ? ` WHERE instance_id IN (${instanceIds.map(() => "?").join(",")})` : ""
     return this.db
-      .query("SELECT instance_id,node_id,metadata_json,connected,last_seen FROM tuis ORDER BY last_seen DESC")
-      .all() as Array<{
+      .query(`SELECT instance_id,node_id,metadata_json,connected,last_seen FROM tuis${where} ORDER BY last_seen DESC`)
+      .all(...(instanceIds ?? [])) as Array<{
       instance_id: string
       node_id: string
       metadata_json: string
       connected: number
       last_seen: number
     }>
+  }
+
+  activeTuiCount() {
+    return (this.db.query("SELECT COUNT(*) AS count FROM tuis WHERE connected=1").get() as { count: number }).count
+  }
+
+  upsertSessionTelemetry(nodeId: string, instanceId: string, telemetry: SessionTelemetry) {
+    const payload = JSON.stringify(telemetry)
+    if (Buffer.byteLength(payload) > MAX_SESSION_TELEMETRY_ROW_BYTES) return false
+    return this.db.transaction(() => {
+      this.db
+        .query(`INSERT INTO session_telemetry(node_id,instance_id,session_id,payload_json,source_updated_at,updated_at)
+          VALUES(?,?,?,?,?,?) ON CONFLICT(node_id,session_id) DO UPDATE SET instance_id=excluded.instance_id,
+          payload_json=excluded.payload_json,source_updated_at=excluded.source_updated_at,updated_at=excluded.updated_at
+          WHERE excluded.source_updated_at>=session_telemetry.source_updated_at`)
+        .run(nodeId, instanceId, telemetry.sessionId, payload, telemetry.updatedAt, Date.now())
+      this.db
+        .query(
+          "DELETE FROM session_telemetry WHERE rowid IN (SELECT rowid FROM session_telemetry ORDER BY updated_at DESC LIMIT -1 OFFSET ?)",
+        )
+        .run(MAX_SESSION_TELEMETRY_ROWS)
+      this.pruneSessionTelemetry()
+      return true
+    })()
+  }
+
+  private pruneSessionTelemetry() {
+    this.db
+      .query("DELETE FROM session_telemetry WHERE length(CAST(payload_json AS BLOB))>?")
+      .run(MAX_SESSION_TELEMETRY_ROW_BYTES)
+    let total = Number(
+      (
+        this.db
+          .query("SELECT COALESCE(SUM(length(CAST(payload_json AS BLOB))),0) AS bytes FROM session_telemetry")
+          .get() as { bytes: number }
+      ).bytes,
+    )
+    while (total > MAX_SESSION_TELEMETRY_TOTAL_BYTES) {
+      const oldest = this.db
+        .query(
+          "SELECT rowid,length(CAST(payload_json AS BLOB)) AS bytes FROM session_telemetry ORDER BY updated_at,rowid LIMIT 1",
+        )
+        .get() as { rowid: number; bytes: number } | null
+      if (!oldest) break
+      this.db.query("DELETE FROM session_telemetry WHERE rowid=?").run(oldest.rowid)
+      total -= oldest.bytes
+    }
+  }
+
+  listSessionTelemetry(updatedAfter = 0) {
+    return this.db
+      .query(
+        "SELECT node_id,instance_id,session_id,payload_json,updated_at FROM session_telemetry WHERE updated_at>=? ORDER BY updated_at DESC LIMIT ?",
+      )
+      .all(updatedAfter, MAX_SESSION_TELEMETRY_ROWS) as SessionTelemetryRow[]
+  }
+
+  clearSessionTelemetry() {
+    this.db.query("DELETE FROM session_telemetry").run()
+  }
+
+  cleanupTelemetry(now: number, retentionMs: number) {
+    this.db.query("DELETE FROM session_telemetry WHERE updated_at<?").run(now - retentionMs)
   }
 
   upsertPending(nodeId: string, event: BridgeEvent & { requestId: string }) {
@@ -452,7 +551,7 @@ export class HubStore {
       this.db.query("DELETE FROM meta WHERE key='hub_lease'").run()
   }
 
-  cleanup(now = Date.now()) {
+  cleanup(now = Date.now(), telemetryRetentionMs = 24 * 60 * 60_000) {
     const expired = this.db
       .query(
         "SELECT pending.* FROM pending JOIN actions ON actions.pending_identity=pending.identity WHERE pending.state='dispatching' AND actions.state='dispatching' AND actions.expires_at<=?",
@@ -472,7 +571,9 @@ export class HubStore {
       .query("UPDATE pending SET state='expired',updated_at=? WHERE state IN ('pending','failed') AND expires_at<=?")
       .run(now, now)
     this.db.query("DELETE FROM events WHERE created_at<?").run(now - 7 * 24 * 60 * 60_000)
+    this.cleanupTelemetry(now, telemetryRetentionMs)
     const retention = now - 30 * 24 * 60 * 60_000
+    this.db.query("DELETE FROM tuis WHERE connected=0 AND last_seen<?").run(retention)
     this.db.transaction(() => {
       this.db
         .query(

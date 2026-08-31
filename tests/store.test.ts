@@ -102,6 +102,129 @@ describe("hub persistence and idempotency", () => {
     store.close()
   })
 
+  test("keeps only the latest bounded telemetry snapshot and expires it", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    const telemetry = {
+      sessionId: "session-a",
+      capture: "metadata" as const,
+      title: "Session",
+      status: "busy" as const,
+      updatedAt: 1,
+      cost: 0,
+      tokens: { input: 1, output: 2, reasoning: 3, cacheRead: 4, cacheWrite: 5 },
+      todos: [],
+      activities: [],
+    }
+    store.upsertSessionTelemetry("node-a", "instance-a", telemetry)
+    store.upsertSessionTelemetry("node-a", "instance-b", { ...telemetry, title: "Updated", updatedAt: 2 })
+    store.upsertSessionTelemetry("node-a", "instance-c", { ...telemetry, title: "Stale", updatedAt: 1 })
+    expect(store.listSessionTelemetry()).toHaveLength(1)
+    expect(store.listSessionTelemetry()[0]?.payload_json).toContain("Updated")
+    expect(store.listSessionTelemetry(Date.now() + 1)).toHaveLength(0)
+    store.cleanup(Date.now() + 2, 1)
+    expect(store.listSessionTelemetry()).toHaveLength(0)
+    store.close()
+  })
+
+  test("bounds stored telemetry and disconnects all TUIs for a lost node", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    store.registerTui("node-a", {
+      instanceId: "instance-a",
+      project: "project",
+      directory: "/project",
+      worktree: "/project",
+      pid: 1,
+      hostname: "host",
+      opencodeVersion: "1",
+      pluginVersion: "1",
+      startedAt: 1,
+      location: { directory: "/project" },
+      capabilities: {
+        permissionReply: true,
+        savedPermission: true,
+        questionReply: true,
+        questionReject: true,
+        sessionExecutionEvents: true,
+        pendingSync: true,
+        workspaceRouting: true,
+        locationRouting: true,
+        sessionHierarchy: true,
+      },
+    })
+    for (let index = 0; index < 140; index++) {
+      store.upsertSessionTelemetry("node-a", "instance-a", {
+        sessionId: `session-${index}`,
+        capture: "metadata",
+        status: "idle",
+        updatedAt: index,
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        todos: [],
+        activities: [],
+      })
+    }
+    expect(store.listSessionTelemetry()).toHaveLength(128)
+    store.disconnectNodeTuis("node-a")
+    expect(store.listTuis()[0]?.connected).toBe(0)
+    store.db.query("UPDATE tuis SET last_seen=1").run()
+    store.disconnectNodeTuis("node-a")
+    expect(store.listTuis()[0]?.last_seen).toBe(1)
+    store.db.query("UPDATE tuis SET connected=1").run()
+    store.disconnectAllTuis()
+    expect(store.listTuis()[0]?.connected).toBe(0)
+    store.clearSessionTelemetry()
+    expect(store.listSessionTelemetry()).toHaveLength(0)
+    store.close()
+  })
+
+  test("enforces per-session and aggregate telemetry byte quotas", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    const telemetry = {
+      capture: "full" as const,
+      status: "idle" as const,
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+      todos: Array.from({ length: 64 }, (_, index) => ({
+        content: `todo-${index}-${"x".repeat(980)}`,
+        status: "pending",
+        priority: "high",
+      })),
+      activities: Array.from({ length: 48 }, (_, index) => ({
+        id: `activity-${index}`,
+        type: "tool" as const,
+        title: "Tool",
+        detail: "x".repeat(2400),
+      })),
+    }
+    for (let index = 0; index < 30; index++)
+      expect(
+        store.upsertSessionTelemetry("node-a", "instance-a", {
+          ...telemetry,
+          sessionId: `session-${index}`,
+          updatedAt: index,
+        }),
+      ).toBeTrue()
+    const total = store.db
+      .query("SELECT COALESCE(SUM(length(CAST(payload_json AS BLOB))),0) AS bytes FROM session_telemetry")
+      .get() as { bytes: number }
+    expect(total.bytes).toBeLessThanOrEqual(4 * 1024 * 1024)
+    expect(
+      store.upsertSessionTelemetry("node-a", "instance-a", {
+        ...telemetry,
+        sessionId: "session-oversized",
+        title: "x".repeat(400 * 1024),
+        updatedAt: 100,
+      }),
+    ).toBeFalse()
+    store.close()
+  })
+
   test("persists action commands and results across node store restart", () => {
     const temp = temporaryDirectory()
     cleanup.push(temp.remove)

@@ -4,6 +4,14 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-31
+
+### Added
+
+- Authenticated, read-only hub dashboard for live and recent OpenCode sessions.
+- Bounded metadata, activity, and full telemetry capture levels with token, cost, todo, reasoning, tool, and log views.
+- Read-only Telegram session dashboard with viewer-authorized inline navigation, activity, todo, usage, and refresh controls.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

@@ -1,7 +1,7 @@
 import type { Config } from "./config.ts"
-import type { BridgeEvent, PermissionAsked, QuestionAsked, Role } from "./protocol.ts"
+import type { BridgeEvent, PermissionAsked, QuestionAsked, Role, SessionTelemetry } from "./protocol.ts"
 import type { HubStore, PendingRow } from "./store.ts"
-import { clip, createLogger, escapeHtml, sleep } from "./util.ts"
+import { clip, createLogger, escapeHtml, randomId, sleep } from "./util.ts"
 import { PROTOCOL_VERSION, VERSION } from "./version.ts"
 
 type TelegramResponse<T> =
@@ -18,15 +18,64 @@ type TelegramMessage = {
 type TelegramCallback = { id: string; data?: string; from: { id: number }; message?: TelegramMessage }
 type TelegramUpdate = { update_id: number; message?: TelegramMessage; callback_query?: TelegramCallback }
 
+class TelegramApiError extends Error {
+  constructor(
+    readonly code: number,
+    description: string,
+  ) {
+    super(`Telegram API ${code}: ${description}`)
+  }
+}
+
 export type HubView = {
   uptimeMs(): number
   connectedNodeIds(): string[]
+  dashboardSnapshot(): DashboardSnapshot
   dispatch(
     row: PendingRow,
     operation: "once" | "always" | "reject" | "answer" | "cancel",
     data?: { message?: string; answers?: string[][] },
   ): Promise<void>
 }
+
+export type DashboardSession = SessionTelemetry & {
+  key: string
+  nodeId: string
+  nodeName: string
+  instanceId: string
+  project: string
+  directory?: string
+  connected: boolean
+}
+
+export type DashboardSnapshot = {
+  generatedAt: number
+  totals: {
+    nodes: number
+    connectedNodes: number
+    sessions: number
+    busy: number
+    pending: number
+    cost: number
+  }
+  sessions: DashboardSession[]
+}
+
+type DashboardView = {
+  token: string
+  chatId: number
+  userId: number
+  threadId?: number
+  messageId: number
+  keys: string[]
+  revision: number
+  page: number
+  selectedKey?: string
+  mode: "detail" | "activity" | "todos"
+  expiresAt: number
+}
+
+type InlineKeyboard = Array<Array<{ text: string; callback_data: string }>>
 
 function roleAllows(role: Role, required: Role) {
   const rank: Record<Role, number> = { viewer: 0, approver: 1, owner: 2 }
@@ -108,6 +157,7 @@ function questionDraft(row: PendingRow): QuestionDraft {
 export class TelegramGateway {
   private readonly log = createLogger("telegram")
   private readonly controller = new AbortController()
+  private readonly dashboardViews = new Map<string, DashboardView>()
   private botUsername = ""
 
   constructor(
@@ -129,7 +179,7 @@ export class TelegramGateway {
     if (!body.ok) {
       if (body.error_code === 429 && body.parameters?.retry_after)
         await sleep(body.parameters.retry_after * 1000, this.controller.signal)
-      throw new Error(`Telegram ${method}: ${body.description}`)
+      throw new TelegramApiError(body.error_code, `${method}: ${body.description}`)
     }
     return body.result
   }
@@ -328,7 +378,235 @@ export class TelegramGateway {
     await this.api("answerCallbackQuery", { callback_query_id: id, text: clip(text, 180), show_alert: alert })
   }
 
+  private pruneDashboardViews() {
+    const now = Date.now()
+    for (const [token, view] of this.dashboardViews) if (view.expiresAt <= now) this.dashboardViews.delete(token)
+    while (this.dashboardViews.size >= 256) {
+      const oldest = this.dashboardViews.keys().next().value
+      if (!oldest) break
+      this.dashboardViews.delete(oldest)
+    }
+  }
+
+  private dashboardData(view: DashboardView, operation: string, value?: number) {
+    return `v:${view.token}:${view.revision}:${operation}${value === undefined ? "" : `:${value}`}`
+  }
+
+  private dashboardAge(timestamp: number) {
+    const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000))
+    if (seconds < 60) return `${seconds}s ago`
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+    return `${Math.floor(seconds / 3600)}h ago`
+  }
+
+  private dashboardPresentation(view: DashboardView, snapshot: DashboardSnapshot) {
+    const sessions = new Map(snapshot.sessions.map((session) => [session.key, session]))
+    const availableKeys = view.keys.filter((key) => sessions.has(key))
+    const nextKeys = [
+      ...availableKeys,
+      ...snapshot.sessions.map((session) => session.key).filter((key) => !availableKeys.includes(key)),
+    ]
+    if (nextKeys.length !== view.keys.length || nextKeys.some((key, index) => key !== view.keys[index])) {
+      view.keys = nextKeys
+      view.revision++
+    }
+    const selected = view.selectedKey ? sessions.get(view.selectedKey) : undefined
+    if (!view.selectedKey) {
+      const pageSize = 5
+      const pages = Math.max(1, Math.ceil(view.keys.length / pageSize))
+      view.page = Math.min(Math.max(0, view.page), pages - 1)
+      const start = view.page * pageSize
+      const keyboard: InlineKeyboard = view.keys.slice(start, start + pageSize).flatMap((key, offset) => {
+        const session = sessions.get(key)
+        if (!session) return []
+        const state = !session.connected ? "○" : session.status === "busy" ? "◐" : "●"
+        const label = session.title || `${clip(session.project, 24)} · ${session.sessionId.slice(-8)}`
+        return [
+          [
+            {
+              text: `${state} ${clip(label, 38)}`,
+              callback_data: this.dashboardData(view, "o", start + offset),
+            },
+          ],
+        ]
+      })
+      if (pages > 1)
+        keyboard.push([
+          { text: "←", callback_data: this.dashboardData(view, "p", Math.max(0, view.page - 1)) },
+          { text: `${view.page + 1}/${pages}`, callback_data: this.dashboardData(view, "p", view.page) },
+          { text: "→", callback_data: this.dashboardData(view, "p", Math.min(pages - 1, view.page + 1)) },
+        ])
+      keyboard.push([{ text: "↻ Refresh", callback_data: this.dashboardData(view, "r") }])
+      const totals = snapshot.totals
+      const text = view.keys.length
+        ? `<b>OpenCode dashboard</b> · read-only\n\nNodes: <b>${totals.connectedNodes}/${totals.nodes}</b> · Sessions: <b>${totals.sessions}</b> · Running: <b>${totals.busy}</b>\nPending: <b>${totals.pending}</b> · Cost: <b>$${totals.cost.toFixed(3)}</b>\n\nSelect a session. Updated ${this.dashboardAge(snapshot.generatedAt)}.`
+        : `<b>OpenCode dashboard</b> · read-only\n\nNo retained session telemetry is currently available.\n\nUpdated ${this.dashboardAge(snapshot.generatedAt)}.`
+      return { text, keyboard }
+    }
+    if (!selected)
+      return {
+        text: "<b>Session unavailable</b>\n\nIt expired or is no longer retained.",
+        keyboard: [
+          [{ text: "← Sessions", callback_data: this.dashboardData(view, "l") }],
+          [{ text: "↻ Refresh", callback_data: this.dashboardData(view, "r") }],
+        ] satisfies InlineKeyboard,
+      }
+    const title = escapeHtml(clip(selected.title || selected.sessionId, 80))
+    let text = ""
+    if (view.mode === "activity") {
+      const activities = selected.activities.slice(-6).reverse()
+      const heading = `<b>Activity</b> · ${title}`
+      const blocks: string[] = []
+      for (const activity of activities) {
+        const block = `<b>${escapeHtml(clip(activity.title, 60))}</b>${activity.status ? ` · ${escapeHtml(clip(activity.status, 32))}` : ""}${activity.detail ? `\n<code>${escapeHtml(clip(activity.detail, 220))}</code>` : ""}`
+        if (`${heading}\n\n${[...blocks, block].join("\n\n")}`.length > 3600) break
+        blocks.push(block)
+      }
+      text = `${heading}\n\n${blocks.join("\n\n") || "No captured activity."}`
+    } else if (view.mode === "todos") {
+      const heading = `<b>Todos</b> · ${title}`
+      const lines: string[] = []
+      for (const todo of selected.todos.slice(0, 12)) {
+        const line = `${todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "◐" : "○"} ${escapeHtml(clip(todo.content, 240))}`
+        if (`${heading}\n\n${[...lines, line].join("\n")}`.length > 3600) break
+        lines.push(line)
+      }
+      text = `${heading}\n\n${lines.join("\n") || "No captured todos."}`
+    } else {
+      const tokens = selected.tokens
+      const model = [selected.provider, selected.model].filter(Boolean).join("/") || "unknown"
+      const effectiveStatus = selected.connected ? selected.status : "offline"
+      text = `<b>${title}</b>\n\n${!selected.connected ? "○" : selected.status === "busy" ? "◐" : "●"} <b>${escapeHtml(effectiveStatus)}</b> · ${escapeHtml(clip(selected.nodeName, 60))}\nProject: <code>${escapeHtml(clip(selected.project, 60))}</code>${selected.directory ? `\nPath: <code>${escapeHtml(clip(selected.directory, 100))}</code>` : ""}\nAgent: <code>${escapeHtml(clip(selected.agent || "unknown", 40))}</code>\nModel: <code>${escapeHtml(clip(model, 60))}</code>\n\nTokens: <b>${Math.round(tokens.input + tokens.output).toLocaleString("en-US")}</b> · In ${Math.round(tokens.input).toLocaleString("en-US")} · Out ${Math.round(tokens.output).toLocaleString("en-US")}\nCache read: ${Math.round(tokens.cacheRead).toLocaleString("en-US")} · Reasoning: ${Math.round(tokens.reasoning).toLocaleString("en-US")}\nCost: <b>$${selected.cost.toFixed(4)}</b> · Capture: <code>${selected.capture}</code>\nUpdated ${this.dashboardAge(selected.updatedAt)}.`
+    }
+    const keyboard: InlineKeyboard = [
+      [
+        { text: `Activity ${selected.activities.length}`, callback_data: this.dashboardData(view, "a") },
+        { text: `Todos ${selected.todos.length}`, callback_data: this.dashboardData(view, "t") },
+      ],
+      [
+        { text: "Overview", callback_data: this.dashboardData(view, "d") },
+        { text: "↻ Refresh", callback_data: this.dashboardData(view, "r") },
+      ],
+      [{ text: "← Sessions", callback_data: this.dashboardData(view, "l") }],
+    ]
+    return { text, keyboard }
+  }
+
+  private async sendDashboard(message: TelegramMessage) {
+    if (!message.from) return
+    this.pruneDashboardViews()
+    const snapshot = this.hub.dashboardSnapshot()
+    const view: DashboardView = {
+      token: randomId("dv", 8),
+      chatId: message.chat.id,
+      userId: message.from.id,
+      ...(message.message_thread_id ? { threadId: message.message_thread_id } : {}),
+      messageId: 0,
+      keys: snapshot.sessions.map((session) => session.key),
+      revision: 0,
+      page: 0,
+      mode: "detail",
+      expiresAt: Date.now() + 30 * 60_000,
+    }
+    const presentation = this.dashboardPresentation(view, snapshot)
+    const sent = await this.api<TelegramMessage>("sendMessage", {
+      chat_id: message.chat.id,
+      ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
+      text: presentation.text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: presentation.keyboard },
+    })
+    view.messageId = sent.message_id
+    this.dashboardViews.set(view.token, view)
+  }
+
+  private async dashboardCallback(callback: TelegramCallback) {
+    const message = callback.message
+    const chatId = message?.chat.id
+    const parts = callback.data?.split(":") ?? []
+    const view = parts[1] ? this.dashboardViews.get(parts[1]) : undefined
+    const expired = Boolean(view && view.expiresAt <= Date.now())
+    if (
+      !message ||
+      !chatId ||
+      !this.authorized(chatId, callback.from.id, message.message_thread_id, "viewer") ||
+      !view ||
+      expired ||
+      view.chatId !== chatId ||
+      view.userId !== callback.from.id ||
+      view.threadId !== message.message_thread_id ||
+      view.messageId !== message.message_id
+    ) {
+      if (view && expired) this.dashboardViews.delete(view.token)
+      await this.answerCallback(callback.id, "Dashboard expired or is not yours. Run /dashboard again.", true)
+      return
+    }
+    if (Number(parts[2]) !== view.revision) {
+      await this.answerCallback(callback.id, "Dashboard changed. Use the latest buttons.", true)
+      return
+    }
+    const previous = {
+      keys: [...view.keys],
+      revision: view.revision,
+      page: view.page,
+      mode: view.mode,
+      selectedKey: view.selectedKey,
+    }
+    const operation = parts[3]
+    let snapshot: DashboardSnapshot | undefined
+    if (operation === "l") {
+      delete view.selectedKey
+      view.mode = "detail"
+    } else if (operation === "p") view.page = Math.max(0, Number(parts[4]) || 0)
+    else if (operation === "o") {
+      const key = view.keys[Number(parts[4])]
+      if (key) view.selectedKey = key
+      else delete view.selectedKey
+      view.mode = "detail"
+    } else if (operation === "a") view.mode = "activity"
+    else if (operation === "t") view.mode = "todos"
+    else if (operation === "d") view.mode = "detail"
+    else if (operation === "r") {
+      snapshot = this.hub.dashboardSnapshot()
+      view.keys = snapshot.sessions.map((session) => session.key)
+      view.revision++
+      if (view.selectedKey && !view.keys.includes(view.selectedKey)) delete view.selectedKey
+      view.page = Math.min(view.page, Math.max(0, Math.ceil(view.keys.length / 5) - 1))
+    } else {
+      await this.answerCallback(callback.id, "Invalid dashboard action.", true)
+      return
+    }
+    snapshot ??= this.hub.dashboardSnapshot()
+    const presentation = this.dashboardPresentation(view, snapshot)
+    try {
+      await this.api("editMessageText", {
+        chat_id: chatId,
+        message_id: message.message_id,
+        text: presentation.text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: presentation.keyboard },
+      })
+    } catch (error) {
+      if (!String(error).toLowerCase().includes("message is not modified")) {
+        view.keys = previous.keys
+        view.revision = previous.revision
+        view.page = previous.page
+        view.mode = previous.mode
+        if (previous.selectedKey) view.selectedKey = previous.selectedKey
+        else delete view.selectedKey
+        throw error
+      }
+    }
+    await this.answerCallback(callback.id, operation === "r" ? "Dashboard refreshed" : "Updated")
+  }
+
   private async callback(callback: TelegramCallback) {
+    if (callback.data?.startsWith("v:")) {
+      await this.dashboardCallback(callback)
+      return
+    }
     const chatId = callback.message?.chat.id
     if (!chatId || !this.authorized(chatId, callback.from.id, callback.message?.message_thread_id, "approver")) {
       await this.answerCallback(callback.id, "Not authorized.", true)
@@ -367,8 +645,8 @@ export class TelegramGateway {
       return
     }
     if (parts[0] === "a" && parts[2] === "f") {
-      await this.answerCallback(callback.id, "Reply to this message with rejection feedback.")
       this.store.setDraft(row.identity, { mode: "reject_feedback" })
+      await this.answerCallback(callback.id, "Reply to this message with rejection feedback.")
       return
     }
     let operation: "once" | "always" | "reject" | "answer" | "cancel" | undefined
@@ -450,7 +728,11 @@ export class TelegramGateway {
       await this.answerCallback(callback.id, "Invalid or stale action.", true)
       return
     }
-    await this.answerCallback(callback.id, "Sending to the exact OpenCode TUI...")
+    try {
+      await this.answerCallback(callback.id, "Sending to the exact OpenCode TUI...")
+    } catch (error) {
+      this.log.warn("callback acknowledgement failed before dispatch", { error })
+    }
     await this.updatePending(row, "⌛ Waiting for OpenCode confirmation")
     try {
       await this.hub.dispatch(row, operation, data)
@@ -465,12 +747,16 @@ export class TelegramGateway {
     const text = message.text?.trim() ?? ""
     if (text.startsWith("/")) {
       const command = text.split(/\s/, 1)[0]?.split("@")[0]
+      if (command === "/dashboard" || command === "/sessions") {
+        await this.sendDashboard(message)
+        return
+      }
       const nodes = this.store.listNodes()
       const tuis = this.store.listTuis()
       const pending = this.store.listPending()
       let response = ""
       if (command === "/start" || command === "/help")
-        response = "<b>OpenCode Telegram</b>\n\n/status /nodes /sessions /pending /whoami /help"
+        response = "<b>OpenCode Telegram</b>\n\n/dashboard /status /nodes /sessions /pending /whoami /help"
       else if (command === "/status")
         response = `<b>Healthy</b>\nVersion: <code>${VERSION}</code>\nProtocol: <code>${PROTOCOL_VERSION}</code>\nUptime: ${Math.round(this.hub.uptimeMs() / 1000)}s\nConnected nodes: ${this.hub.connectedNodeIds().length}\nActive TUIs: ${tuis.filter((tui) => tui.connected).length}\nPending: ${pending.length}`
       else if (command === "/nodes")
@@ -481,15 +767,6 @@ export class TelegramGateway {
               )
               .join("\n")
           : "No enrolled nodes."
-      else if (command === "/sessions")
-        response = tuis.length
-          ? tuis
-              .map((tui) => {
-                const meta = JSON.parse(tui.metadata_json) as { project: string; sessionTitle?: string }
-                return `${tui.connected ? "●" : "○"} ${escapeHtml(meta.project)}${meta.sessionTitle ? ` — ${escapeHtml(clip(meta.sessionTitle, 80))}` : ""}`
-              })
-              .join("\n")
-          : "No registered TUIs."
       else if (command === "/pending")
         response = pending.length
           ? pending.map((row) => `⚠ ${escapeHtml(row.kind)} <code>${row.request_id.slice(0, 12)}</code>`).join("\n")
@@ -504,7 +781,14 @@ export class TelegramGateway {
         this.store.setMuted("chat", String(message.chat.id), false)
         response = "Notifications unmuted for this chat."
       }
-      if (response) await this.api("sendMessage", { chat_id: message.chat.id, text: response, parse_mode: "HTML" })
+      if (response)
+        await this.api("sendMessage", {
+          chat_id: message.chat.id,
+          ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
+          text: response,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        })
       return
     }
     const replied = message.reply_to_message
@@ -557,8 +841,14 @@ export class TelegramGateway {
           allowed_updates: ["message", "callback_query"],
         })
         for (const update of updates) {
-          if (update.callback_query) await this.callback(update.callback_query)
-          if (update.message) await this.message(update.message)
+          try {
+            if (update.callback_query) await this.callback(update.callback_query)
+            if (update.message) await this.message(update.message)
+          } catch (error) {
+            if (!(error instanceof TelegramApiError) || error.code < 400 || error.code >= 500 || error.code === 429)
+              throw error
+            this.log.warn("telegram update rejected permanently", { update: update.update_id, error })
+          }
           offset = Math.max(offset, update.update_id + 1)
           this.store.setTelegramOffset(offset)
         }

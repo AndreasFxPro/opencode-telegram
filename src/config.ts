@@ -46,6 +46,13 @@ export const ConfigSchema = z.object({
     })
     .default({ apiBase: "https://api.telegram.org", authorizedChats: [], authorizedUsers: [], pollTimeoutSeconds: 25 }),
   features: z.object({ remotePrompt: z.boolean().default(false) }).default({ remotePrompt: false }),
+  dashboard: z
+    .object({
+      enabled: z.boolean().default(false),
+      capture: z.enum(["metadata", "activity", "full"]).default("metadata"),
+      retentionHours: z.number().int().min(1).max(720).default(24),
+    })
+    .default({ enabled: false, capture: "metadata", retentionHours: 24 }),
   notifications: z
     .object({
       permission: z.boolean().default(true),
@@ -86,6 +93,7 @@ export const SecretsSchema = z.object({
   localPluginSecret: z.string().min(32),
   nodeId: z.string().min(8),
   nodeCredential: z.string().min(32).optional(),
+  dashboardToken: z.string().min(32).optional(),
 })
 export type Secrets = z.infer<typeof SecretsSchema>
 

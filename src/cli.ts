@@ -12,6 +12,7 @@ import {
   loadSecrets,
   saveConfig,
   secretPath,
+  splitListen,
 } from "./config.ts"
 import { Hub } from "./hub.ts"
 import { NodeService } from "./node.ts"
@@ -61,9 +62,22 @@ async function input(label: string, fallback?: string) {
 
 function requireSecureRemote(urlValue: string, insecureAllowed = false) {
   const url = new URL(urlValue)
-  const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
-  if (url.protocol !== "https:" && !loopback && !insecureAllowed)
+  const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname.replace(/^\[|\]$/g, ""))
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback) && !insecureAllowed)
     throw new Error(`Refusing to send credentials over insecure non-loopback URL: ${url.origin}`)
+}
+
+function requireLoopbackDashboardListener(config: Config) {
+  const hostname = splitListen(config.hub.listen).hostname
+  if (!["localhost", "127.0.0.1", "::1"].includes(hostname))
+    throw new Error("Dashboard listener must be loopback-only; expose it through an HTTPS reverse proxy")
+}
+
+function dashboardPublicUrl(config: Config) {
+  if (config.hub.publicUrl) return config.hub.publicUrl.replace(/\/$/, "")
+  const listen = splitListen(config.hub.listen)
+  const hostname = listen.hostname.includes(":") ? `[${listen.hostname}]` : listen.hostname
+  return `http://${hostname}:${listen.port}`
 }
 
 async function telegramGetMe(apiBase: string, token: string) {
@@ -312,6 +326,72 @@ async function nodeAdmin() {
   }
 }
 
+function dashboardAdmin() {
+  const operation = args[1]
+  const config = loadConfig()
+  const secrets = loadSecrets()
+  if (operation === "capture") {
+    const capture = args[2]
+    if (capture !== "metadata" && capture !== "activity" && capture !== "full")
+      throw new Error("Usage: dashboard capture metadata|activity|full")
+    config.dashboard.capture = capture
+    saveConfig(config, secrets)
+    console.log(`Dashboard capture set to ${capture}. Restart the service and OpenCode TUIs.`)
+    return
+  }
+  if (operation === "enable") {
+    if (config.mode === "node") {
+      config.dashboard.enabled = true
+      saveConfig(config, secrets)
+      console.log("Dashboard telemetry enabled for this node. Restart the node service and OpenCode TUIs to apply.")
+      return
+    }
+    const base = dashboardPublicUrl(config)
+    requireSecureRemote(base)
+    requireLoopbackDashboardListener(config)
+    config.dashboard.enabled = true
+    secrets.dashboardToken ??= randomId("oct_dash", 32)
+    saveConfig(config, secrets)
+    console.log(`Dashboard: ${base}/dashboard\nToken: ${secrets.dashboardToken}\nRestart the service to apply.`)
+    return
+  }
+  if (operation === "disable") {
+    config.dashboard.enabled = false
+    delete secrets.dashboardToken
+    if (config.mode === "node") {
+      saveConfig(config, secrets)
+      console.log("Dashboard telemetry disabled for this node. Restart the node service and OpenCode TUIs to apply.")
+      return
+    }
+    const databasePath = join(dataDir(config), "hub.db")
+    if (existsSync(databasePath)) {
+      const store = new HubStore(databasePath)
+      store.clearSessionTelemetry()
+      store.close()
+    }
+    saveConfig(config, secrets)
+    console.log(
+      "Dashboard disabled in config, token deleted, and stored telemetry purged. Restart the service to apply.",
+    )
+    return
+  }
+  if (operation === "rotate") {
+    if (config.mode === "node") throw new Error("Dashboard hosting is available only in hub or standalone mode")
+    if (!config.dashboard.enabled) throw new Error("Dashboard is disabled")
+    secrets.dashboardToken = randomId("oct_dash", 32)
+    saveConfig(config, secrets)
+    console.log(`Dashboard token rotated:\n${secrets.dashboardToken}\nRestart the service to apply.`)
+    return
+  }
+  if (operation === "token") {
+    if (config.mode === "node") throw new Error("Dashboard hosting is available only in hub or standalone mode")
+    if (!config.dashboard.enabled || !secrets.dashboardToken) throw new Error("Dashboard is disabled")
+    console.log(secrets.dashboardToken)
+    return
+  }
+  throw new Error("Usage: dashboard enable|disable|token|rotate|capture metadata|activity|full")
+}
+
 async function fetchHealth(url: string, authorization?: string) {
   try {
     const response = await fetch(url, {
@@ -463,7 +543,7 @@ function serviceCommand(operation: string) {
 
 function help() {
   console.log(
-    `opencode-telegram ${VERSION}\n\nUsage:\n  opencode-telegram setup [standalone|hub|node]\n  opencode-telegram standalone | hub | node\n  opencode-telegram status | doctor [--json] | test | logs\n  opencode-telegram node create|list|revoke|rename\n  opencode-telegram service install|start|stop|restart|status\n  opencode-telegram config show|validate\n  opencode-telegram instructions install|uninstall\n  opencode-telegram uninstall --yes\n  opencode-telegram version\n`,
+    `opencode-telegram ${VERSION}\n\nUsage:\n  opencode-telegram setup [standalone|hub|node]\n  opencode-telegram standalone | hub | node\n  opencode-telegram status | doctor [--json] | test | logs\n  opencode-telegram node create|list|revoke|rename\n  opencode-telegram dashboard enable|disable|token|rotate|capture\n  opencode-telegram service install|start|stop|restart|status\n  opencode-telegram config show|validate\n  opencode-telegram instructions install|uninstall\n  opencode-telegram uninstall --yes\n  opencode-telegram version\n`,
   )
 }
 
@@ -472,6 +552,7 @@ async function main() {
   if (command === "standalone" || command === "hub") return runServices(command)
   if (command === "node" && !["create", "list", "revoke", "rename"].includes(args[1] ?? "")) return runServices("node")
   if (command === "node") return nodeAdmin()
+  if (command === "dashboard") return dashboardAdmin()
   if (command === "doctor" || command === "status") return doctor()
   if (command === "service") {
     if (args[1] === "install") return serviceInstall()

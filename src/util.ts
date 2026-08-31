@@ -30,7 +30,7 @@ export function clip(value: unknown, max: number) {
 export function redact(value: unknown) {
   return clip(value, 4096)
     .replace(/\b\d{8,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_BOT_TOKEN]")
-    .replace(/\b(?:sk|ghp|oct_join|oct_node)_[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_SECRET]")
+    .replace(/\b(?:sk|ghp|oct_join|oct_node|oct_dash|local)_[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_SECRET]")
     .replace(/(authorization\s*[:=]\s*)(?:Bearer\s+)?\S+/gi, "$1[REDACTED]")
 }
 

@@ -2,11 +2,18 @@ import { hostname } from "node:os"
 import { basename } from "node:path"
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2"
-import { loadSecrets } from "../config.ts"
-import { ActionDispatchSchema, type BridgeEvent, type LocalRequest, type TuiMetadata } from "../protocol.ts"
+import { loadConfig, loadSecrets } from "../config.ts"
+import {
+  ActionDispatchSchema,
+  type BridgeEvent,
+  type LocalRequest,
+  MAX_TELEMETRY_BATCH_BYTES,
+  type TuiMetadata,
+} from "../protocol.ts"
 import { clip, randomId, sleep } from "../util.ts"
 import { VERSION } from "../version.ts"
 import { OpenCodeAdapter } from "./adapter.ts"
+import { boundedTelemetry, sessionTelemetry } from "./telemetry.ts"
 
 function tmuxMetadata() {
   return process.env.TMUX_PANE || undefined
@@ -89,6 +96,21 @@ function questionEvent(api: TuiPluginApi, instanceId: string, request: QuestionR
   }
 }
 
+class NodeRequestError extends Error {
+  constructor(readonly status: number) {
+    super(`Node returned HTTP ${status}`)
+  }
+}
+
+function replaceableRequest(message: LocalRequest | undefined) {
+  return Boolean(
+    message?.type === "event" &&
+      (message.event.type === "reconcile" ||
+        message.event.type === "execution.started" ||
+        message.event.type === "execution.succeeded"),
+  )
+}
+
 class LocalNodeClient {
   connected = false
   muted = false
@@ -101,18 +123,24 @@ class LocalNodeClient {
   ) {}
 
   enqueue(message: LocalRequest) {
+    if (message.type === "event" && message.event.type === "reconcile") {
+      const start = this.sending ? 1 : 0
+      const offset = this.queue
+        .slice(start)
+        .findIndex(
+          (queued) =>
+            queued.type === "event" &&
+            queued.event.type === "reconcile" &&
+            queued.event.instanceId === message.event.instanceId,
+        )
+      if (offset >= 0) this.queue.splice(start + offset, 1)
+    }
     if (this.queue.length >= 256) {
-      const replaceable = this.queue.findIndex(
-        (queued) =>
-          queued.type === "event" &&
-          (queued.event.type === "execution.started" || queued.event.type === "execution.succeeded"),
-      )
-      if (replaceable >= 0) this.queue.splice(replaceable, 1)
-      else if (
-        message.type === "event" &&
-        (message.event.type === "execution.started" || message.event.type === "execution.succeeded")
-      )
-        return
+      const start = this.sending ? 1 : 0
+      const offset = this.queue.slice(start).findIndex((queued) => replaceableRequest(queued))
+      if (offset >= 0) this.queue.splice(start + offset, 1)
+      else if (replaceableRequest(message)) return
+      else throw new Error("Local node queue is full of correctness-critical events")
     }
     this.queue.push(message)
     void this.flush()
@@ -125,7 +153,7 @@ class LocalNodeClient {
       signal,
       headers: { authorization: `Bearer ${this.secret}`, "content-type": "application/json", ...init?.headers },
     })
-    if (!response.ok) throw new Error(`Node returned HTTP ${response.status}`)
+    if (!response.ok) throw new NodeRequestError(response.status)
     this.connected = true
     return response
   }
@@ -136,10 +164,19 @@ class LocalNodeClient {
     try {
       while (this.queue.length) {
         const message = this.queue[0]
+        if (!message) break
         try {
           await this.request("/v1/plugin", { method: "POST", body: JSON.stringify(message) })
           this.queue.shift()
-        } catch {
+        } catch (error) {
+          if (
+            replaceableRequest(message) &&
+            error instanceof NodeRequestError &&
+            (error.status === 400 || error.status === 413)
+          ) {
+            this.queue.shift()
+            continue
+          }
           this.connected = false
           break
         }
@@ -168,8 +205,10 @@ class LocalNodeClient {
 
 async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
   let secrets: ReturnType<typeof loadSecrets>
+  let dashboard: ReturnType<typeof loadConfig>["dashboard"]
   try {
     secrets = loadSecrets()
+    dashboard = loadConfig().dashboard
   } catch (error) {
     api.ui.toast({ title: "Telegram bridge", variant: "warning", message: clip(error, 300) })
     return
@@ -183,6 +222,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
     { startedAt: number; lastActivity: number; stuckNotified: boolean; busy: Set<string> }
   >()
   const trackedSessions = new Set<string>()
+  const knownSessions = new Set<string>()
   const telegramRequests = new Set<string>()
   let disposed = false
   const stuckMinutes =
@@ -216,8 +256,19 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
     if (!node.muted || event.type === "reconcile") node.enqueue({ type: "event", event })
   }
 
+  function trackSession(sessionId: string) {
+    knownSessions.delete(sessionId)
+    knownSessions.add(sessionId)
+    while (knownSessions.size > 32) {
+      const oldest = knownSessions.values().next().value
+      if (!oldest) break
+      knownSessions.delete(oldest)
+    }
+  }
+
   function reconcile() {
     const sessionId = currentSessionId(api)
+    if (sessionId) trackSession(sessionId)
     const sessionIds = new Set<string>()
     if (sessionId) sessionIds.add(sessionId)
     for (const id of trackedSessions) sessionIds.add(id)
@@ -232,7 +283,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
       adapter.pendingQuestions(id).map((request) => questionEvent(api, instanceId, request)),
     )
     const meta = metadata()
-    emit({
+    const event: Extract<BridgeEvent, { type: "reconcile" }> = {
       type: "reconcile",
       eventId: randomId("evt"),
       emittedAt: Date.now(),
@@ -247,12 +298,29 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
         (event): event is Extract<BridgeEvent, { type: "question.asked" }> => event.type === "question.asked",
       ),
       scopeSessionIds: [...sessionIds],
-    })
+    }
+    if (dashboard.enabled) {
+      const envelopeBytes = new TextEncoder().encode(JSON.stringify({ type: "event", event })).byteLength
+      const telemetryBudget = Math.min(MAX_TELEMETRY_BATCH_BYTES, Math.max(0, 1024 * 1024 - envelopeBytes - 16_384))
+      event.telemetry = boundedTelemetry(
+        [...new Set([...knownSessions, ...sessionIds])]
+          .slice(-8)
+          .map((id) => sessionTelemetry(api, id, dashboard.capture))
+          .filter((item) => item !== undefined),
+        telemetryBudget,
+      )
+    }
+    emit(event)
   }
 
   node.enqueue({ type: "register", metadata: metadata() })
 
   const disposers = [
+    api.event.on("session.created", (event) => trackSession(event.properties.sessionID)),
+    api.event.on("session.updated", (event) => trackSession(event.properties.sessionID)),
+    api.event.on("session.deleted", (event) => knownSessions.delete(event.properties.sessionID)),
+    api.event.on("message.updated", (event) => trackSession(event.properties.sessionID)),
+    api.event.on("todo.updated", (event) => trackSession(event.properties.sessionID)),
     api.event.on("permission.asked", (event) => {
       trackedSessions.add(event.properties.sessionID)
       emit(permissionEvent(api, instanceId, event.properties))
@@ -375,6 +443,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
       })
     }),
     api.event.on("message.part.updated", (event) => {
+      trackSession(event.properties.sessionID)
       const rootId = rootSession(api, event.properties.sessionID)
       const execution = executions.get(rootId)
       if (execution) execution.lastActivity = Date.now()

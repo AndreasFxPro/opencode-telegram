@@ -27,8 +27,10 @@ export class NodeService {
   private socket?: WebSocket
   private localServer?: Server<undefined>
   private heartbeat?: Timer
+  private instanceTimer?: Timer
   private hubConnected = false
   private telegramReachable = false
+  private telemetrySupported = false
   private attempt = 0
 
   constructor(
@@ -42,7 +44,7 @@ export class NodeService {
 
   private assertTransportSecurity() {
     const url = new URL(this.config.node.hubUrl)
-    const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname)
+    const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname.replace(/^\[|\]$/g, ""))
     if (url.protocol !== "wss:" && !loopback && !this.config.node.allowInsecureHub) {
       throw new Error(
         "Non-loopback node-to-hub connections require wss://. Set node.allowInsecureHub only for development.",
@@ -55,6 +57,11 @@ export class NodeService {
     if (!["127.0.0.1", "localhost", "::1"].includes(listen.hostname))
       throw new Error("Plugin-to-node listener must remain loopback-only")
     this.localServer = Bun.serve({ ...listen, fetch: (request) => this.fetch(request), idleTimeout: 30 })
+    this.instanceTimer = setInterval(() => {
+      const cutoff = Date.now() - 20_000
+      for (const [instanceId, instance] of this.instances)
+        if (instance.seenAt < cutoff) this.disconnectInstance(instanceId)
+    }, 10_000)
     void this.connectLoop()
     this.log.info("local listener ready", { address: this.config.node.localListen })
   }
@@ -62,6 +69,7 @@ export class NodeService {
   async stop() {
     this.controller.abort()
     if (this.heartbeat) clearInterval(this.heartbeat)
+    if (this.instanceTimer) clearInterval(this.instanceTimer)
     this.socket?.close(1001, "Node shutting down")
     for (const callbacks of this.waiters.values()) for (const callback of callbacks) callback(undefined)
     this.localServer?.stop(true)
@@ -80,6 +88,21 @@ export class NodeService {
     return request.json() as Promise<unknown>
   }
 
+  private disconnectInstance(instanceId: string) {
+    const instance = this.instances.get(instanceId)
+    this.instances.delete(instanceId)
+    if (!instance) return
+    this.enqueue({
+      type: "tui.disconnected",
+      eventId: `evt_${crypto.randomUUID()}`,
+      emittedAt: Date.now(),
+      instanceId,
+      ...(instance.metadata.sessionId ? { sessionId: instance.metadata.sessionId } : {}),
+      ...(instance.metadata.rootSessionId ? { rootSessionId: instance.metadata.rootSessionId } : {}),
+      location: instance.metadata.location,
+    })
+  }
+
   private async fetch(request: Request) {
     const url = new URL(request.url)
     if (url.pathname === "/health") {
@@ -95,25 +118,23 @@ export class NodeService {
     }
     if (!this.authenticated(request)) return new Response("Forbidden", { status: 403 })
     if (url.pathname === "/v1/plugin" && request.method === "POST") {
+      let body: unknown
       try {
-        const message = LocalRequestSchema.parse(await this.readJson(request))
+        body = await this.readJson(request)
+      } catch (error) {
+        const status = error instanceof Error && error.message.includes("exceeds 1 MiB") ? 413 : 400
+        return Response.json({ error: String(error) }, { status })
+      }
+      const parsed = LocalRequestSchema.safeParse(body)
+      if (!parsed.success) return Response.json({ error: parsed.error.message }, { status: 400 })
+      const message = parsed.data
+      try {
         if (message.type === "register") {
           this.instances.set(message.metadata.instanceId, { seenAt: Date.now(), metadata: message.metadata })
           return Response.json({ ok: true }, { status: 202 })
         }
         if (message.type === "unregister") {
-          const instance = this.instances.get(message.instanceId)
-          this.instances.delete(message.instanceId)
-          if (instance)
-            this.enqueue({
-              type: "tui.disconnected",
-              eventId: `evt_${crypto.randomUUID()}`,
-              emittedAt: Date.now(),
-              instanceId: message.instanceId,
-              ...(instance.metadata.sessionId ? { sessionId: instance.metadata.sessionId } : {}),
-              ...(instance.metadata.rootSessionId ? { rootSessionId: instance.metadata.rootSessionId } : {}),
-              location: instance.metadata.location,
-            })
+          this.disconnectInstance(message.instanceId)
           return Response.json({ ok: true }, { status: 202 })
         }
         if (message.type === "event") {
@@ -130,7 +151,7 @@ export class NodeService {
         this.flushResults()
         return Response.json({ ok: true }, { status: 202 })
       } catch (error) {
-        return Response.json({ error: String(error) }, { status: 400 })
+        return Response.json({ error: String(error) }, { status: 503 })
       }
     }
     if (url.pathname === "/v1/commands" && request.method === "GET") {
@@ -168,7 +189,10 @@ export class NodeService {
   }
 
   private enqueue(event: BridgeEvent) {
-    this.store.enqueue(event, this.config.node.queueLimit)
+    if (event.type === "reconcile" && !this.telemetrySupported) {
+      const { telemetry: _telemetry, ...compatibleEvent } = event
+      this.store.enqueue(compatibleEvent, this.config.node.queueLimit)
+    } else this.store.enqueue(event, this.config.node.queueLimit)
     this.flush()
   }
 
@@ -179,14 +203,19 @@ export class NodeService {
   }
 
   private flush() {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return
+    if (!this.hubConnected || !this.socket || this.socket.readyState !== WebSocket.OPEN) return
     for (const row of this.store.pending()) {
+      const event = JSON.parse(row.payload_json) as BridgeEvent
+      const compatibleEvent =
+        event.type === "reconcile" && !this.telemetrySupported
+          ? (({ telemetry: _telemetry, ...compatible }) => compatible)(event)
+          : event
       this.socket.send(
         JSON.stringify({
           type: "event",
           generation: this.store.generation(),
           seq: row.seq,
-          event: JSON.parse(row.payload_json),
+          event: compatibleEvent,
         }),
       )
       if (this.socket.bufferedAmount > 4 * 1024 * 1024) break
@@ -235,6 +264,7 @@ export class NodeService {
 
   private connect() {
     return new Promise<void>((resolve, reject) => {
+      this.telemetrySupported = false
       const BunWebSocket = WebSocket as typeof WebSocket & {
         new (url: string | URL, options?: Bun.WebSocketOptions): WebSocket
       }
@@ -275,6 +305,7 @@ export class NodeService {
             welcomed = true
             this.hubConnected = true
             this.telegramReachable = message.telegramReachable
+            this.telemetrySupported = Boolean(message.telemetry)
             this.heartbeat = setInterval(() => {
               if (socket.readyState === WebSocket.OPEN)
                 socket.send(JSON.stringify({ type: "heartbeat", at: Date.now() }))
@@ -294,6 +325,8 @@ export class NodeService {
       socket.addEventListener("error", () => fail(new Error("WebSocket connection failed")), { once: true })
       socket.addEventListener("close", () => {
         clearTimeout(timeout)
+        this.hubConnected = false
+        this.telemetrySupported = false
         if (settled) return
         settled = true
         if (welcomed) resolve()

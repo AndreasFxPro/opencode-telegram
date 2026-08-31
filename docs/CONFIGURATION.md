@@ -36,6 +36,18 @@ See [`config.example.json`](../config.example.json). `secrets.json` is generated
 - Final preview: disabled.
 - Remote prompt: disabled and not exposed by the current alpha CLI.
 
+## Dashboard
+
+The hub dashboard is disabled by default. On a hub or standalone host, `opencode-telegram dashboard enable` creates an independent high-entropy token in `secrets.json`; it is never returned by `config show`. In a multi-host deployment, run the same command on each node to opt that node into collection without hosting a dashboard or creating a token. Telemetry is collected only while enabled locally. Disabling deletes the hub token and stored snapshots; restart services and OpenCode TUIs promptly to invalidate in-memory state and stop collection.
+
+`dashboard.capture` is enforced by each node's TUI plugin:
+
+- `metadata`: opaque session ID, status, model, agent, aggregate tokens, cache usage, and cost. Prompt-derived session titles are omitted.
+- `activity`: metadata plus explicit reasoning parts, tool inputs/status, and todos.
+- `full`: activity plus session titles, user/assistant text, tool output/errors, retry errors, and the session directory.
+
+Snapshots are schema-validated, byte- and row-bounded, and retained for `dashboard.retentionHours` (default 24, range 1–720). Existing OpenCode TUIs must restart after enabling the dashboard or changing capture level. Only explicit reasoning parts exposed by OpenCode are captured; hidden chain-of-thought is unavailable. The hub listener must be loopback-only; non-loopback public dashboard URLs require an HTTPS reverse proxy.
+
 The schema reserves one optional `threadId` per authorized chat, allowing a global forum topic without changing message identity. Per-node/project topic policy is planned.
 
 ## Precedence

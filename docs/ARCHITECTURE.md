@@ -8,6 +8,10 @@ The node is one per machine. Its loopback HTTP interface requires a random local
 
 The hub is one per Telegram bot. It authenticates each node separately, persists Telegram offsets and action state, authorizes Telegram roles, and owns the only long poller. SQLite transactions serialize callback admission and action transitions.
 
+The optional dashboard is embedded in the hub binary. Its static shell contains no operational data and its snapshot API requires an independent bearer token. The browser polls bounded read-only snapshots and keeps the token only in memory. Telegram exposes the same validated projection through expiring, user/message-bound inline views. Neither dashboard path dispatches node actions.
+
+TUI reconciliation may carry up to eight bounded session telemetry snapshots. Nodes strip telemetry unless the hub advertises support. The hub stores only the latest snapshot per node/session, removes telemetry from the long-lived event ledger, and applies configured retention.
+
 ## Action Lifecycle
 
 ```text
@@ -43,8 +47,8 @@ OpenCode's pending waits are process-local and not durable. A bridge restart can
 
 ## Backpressure
 
-- TUI queue: 256 messages, oldest dropped. OpenCode is never blocked.
-- Node spool: configurable, default 10,000 events, oldest dropped transactionally.
+- TUI queue: replaceable reconciliation/execution updates are coalesced within a 256-message bound; a queue containing only correctness-critical events fails explicitly instead of silently discarding them.
+- Node spool: configurable, default 10,000 events; replaceable telemetry is discarded before correctness-critical events.
 - WebSocket: flush stops above 4 MiB buffered data and resumes on future activity/reconnect.
 - Telegram: `retry_after` is honored. Failed edits are logged without changing action truth.
 
