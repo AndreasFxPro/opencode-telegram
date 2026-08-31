@@ -72,6 +72,53 @@ describe("hub persistence and idempotency", () => {
     store.close()
   })
 
+  test("reconciliation does not stale an action while OpenCode confirmation is in flight", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    const event = permission()
+    const row = store.upsertPending("node-a", event).row
+    const action = store.createAction(row, {
+      operation: "once",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    })
+    expect(store.reconcileInstance("node-a", event.instanceId, new Set(), new Set([event.sessionId ?? ""]))).toEqual([])
+    expect(store.getPending(row.identity)?.state).toBe("dispatching")
+    store.finishAction(action.actionId, "confirmed")
+    expect(store.getPending(row.identity)?.state).toBe("confirmed")
+    store.close()
+  })
+
+  test("cleanup returns pending expirations so Telegram can make them non-actionable", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    const row = store.upsertPending("node-a", permission()).row
+    store.db.query("UPDATE pending SET expires_at=1 WHERE identity=?").run(row.identity)
+    expect(store.cleanup(2).map((expired) => expired.identity)).toEqual([row.identity])
+    expect(store.getPending(row.identity)?.state).toBe("expired")
+    store.close()
+  })
+
+  test("an old expired action cannot expire a reactivated retry", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const store = new HubStore(join(temp.path, "hub.db"))
+    const event = permission()
+    const row = store.upsertPending("node-a", event).row
+    store.createAction(row, { operation: "once", createdAt: 0, expiresAt: 1 })
+    store.cleanup(2)
+    const reactivated = store.upsertPending("node-a", event)
+    expect(reactivated.reactivated).toBeTrue()
+    const retry = store.createAction(reactivated.row, { operation: "once", createdAt: 2, expiresAt: 100 })
+    store.cleanup(3)
+    expect(store.getPending(row.identity)?.state).toBe("dispatching")
+    store.finishAction(retry.actionId, "confirmed")
+    expect(store.getPending(row.identity)?.state).toBe("confirmed")
+    store.close()
+  })
+
   test("binds pending identities to their originating node", () => {
     const temp = temporaryDirectory()
     cleanup.push(temp.remove)

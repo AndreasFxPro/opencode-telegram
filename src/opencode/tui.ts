@@ -443,6 +443,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
       })
     }),
     api.event.on("message.part.updated", (event) => {
+      adapter.observeExecution(event.properties.sessionID)
       trackSession(event.properties.sessionID)
       const rootId = rootSession(api, event.properties.sessionID)
       const execution = executions.get(rootId)

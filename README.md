@@ -104,7 +104,7 @@ opencode-telegram dashboard capture full     # also prompts, responses, tool out
 
 The browser keeps the token only in memory. The dashboard has no prompt, shell, approval, or mutation endpoint. The hub listener must remain loopback-only and should be exposed through an HTTPS reverse proxy such as Tailscale Serve. Use `dashboard rotate`, `dashboard token`, or `dashboard disable` to administer access. Disabling deletes the token and stored telemetry; restart the hub promptly to invalidate its in-memory token and stop collection.
 
-In Telegram, send `/dashboard` or `/sessions` for the same read-only telemetry through inline session, activity, todo, refresh, and navigation buttons. Each view is bound to the initiating user, chat, topic, and bot message and expires after 30 minutes.
+In Telegram, send `/dashboard` or `/sessions` for the same read-only telemetry. Telegram Bot API 10.3 Rich Messages provide structured usage tables, expandable activity details, `Show full`, and bounded activity/todo pagination; older Bot API servers automatically receive the clipped HTML view. Each view is bound to the initiating user, chat, topic, and bot message and expires after 30 minutes.
 
 ## Updates
 

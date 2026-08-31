@@ -54,6 +54,39 @@ test("node routes an idempotent action only to the originating TUI", async () =>
     }),
   })
   await eventually(() => hub.store.getPending(row.identity)?.state === "confirmed")
+
+  const unconfirmedEvent = {
+    ...permission(),
+    eventId: `evt_${crypto.randomUUID()}`,
+    requestId: "permission-unconfirmed",
+  }
+  await fetch(`${base}/v1/plugin`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ type: "event", event: unconfirmedEvent }),
+  })
+  await eventually(() => hub.store.listPending().some((pending) => pending.request_id === unconfirmedEvent.requestId))
+  const unconfirmed = hub.store.listPending().find((pending) => pending.request_id === unconfirmedEvent.requestId)
+  if (!unconfirmed) throw new Error("Unconfirmed pending row missing")
+  await hub.dispatch(unconfirmed, "once")
+  const unconfirmedCommandResponse = await fetch(
+    `${base}/v1/commands?instanceId=${encodeURIComponent(unconfirmedEvent.instanceId)}`,
+    { headers: auth },
+  )
+  const unconfirmedCommandBody = (await unconfirmedCommandResponse.json()) as { command: { actionId: string } }
+  await fetch(`${base}/v1/plugin`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({
+      type: "action.result",
+      actionId: unconfirmedCommandBody.command.actionId,
+      ok: false,
+      state: "failed",
+      detail: "OpenCode did not confirm resolution: missing session continuation event",
+      evidence: { repliedEvent: true, pendingAbsent: true, executionObserved: false },
+    }),
+  })
+  await eventually(() => hub.store.getPending(unconfirmed.identity)?.state === "failed")
 })
 
 test("node reports a full correctness-critical spool as retryable", async () => {

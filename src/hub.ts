@@ -359,8 +359,10 @@ export class Hub implements HubView {
         if (
           (pendingEvent.type === "permission.asked" && this.config.notifications.permission) ||
           (pendingEvent.type === "question.asked" && this.config.notifications.question)
-        )
+        ) {
+          if (result.reactivated) await this.telegram?.updatePending(result.row, "", true)
           await this.telegram?.notifyPending(result.row)
+        }
       }
       const stale = this.store.reconcileInstance(nodeId, event.instanceId, active, new Set(event.scopeSessionIds))
       for (const row of stale) await this.telegram?.updatePending(row, "⌛ Request is no longer pending in OpenCode")
@@ -370,6 +372,7 @@ export class Hub implements HubView {
       if (event.type === "permission.asked" && !this.config.notifications.permission) return
       if (event.type === "question.asked" && !this.config.notifications.question) return
       const result = this.store.upsertPending(nodeId, event)
+      if (result.reactivated) await this.telegram?.updatePending(result.row, "", true)
       await this.telegram?.notifyPending(result.row)
       return
     }
@@ -433,11 +436,7 @@ export class Hub implements HubView {
       result.evidence?.repliedEvent && result.evidence.pendingAbsent && result.evidence.executionObserved,
     )
     const state =
-      result.ok && result.state === "confirmed" && proven
-        ? "confirmed"
-        : result.state === "stale" || result.evidence?.pendingAbsent
-          ? "stale"
-          : "failed"
+      result.ok && result.state === "confirmed" && proven ? "confirmed" : result.state === "stale" ? "stale" : "failed"
     this.store.finishAction(result.actionId, state, result.detail)
     const row = this.store.getPending(action.pending_identity)
     if (!row) return

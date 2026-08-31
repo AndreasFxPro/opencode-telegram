@@ -370,7 +370,11 @@ export class HubStore {
         now,
         now + 6 * 60 * 60_000,
       )
-    return { row: this.getPending(identity) as PendingRow, created: !existing }
+    return {
+      row: this.getPending(identity) as PendingRow,
+      created: !existing,
+      reactivated: existing?.state === "stale" || existing?.state === "expired",
+    }
   }
 
   pendingIdentity(nodeId: string, event: Parameters<typeof requestIdentity>[0]) {
@@ -442,7 +446,7 @@ export class HubStore {
 
   reconcileInstance(nodeId: string, instanceId: string, activeIdentities: Set<string>, scopeSessionIds: Set<string>) {
     const rows = this.db
-      .query("SELECT * FROM pending WHERE node_id=? AND instance_id=? AND state IN ('pending','dispatching','failed')")
+      .query("SELECT * FROM pending WHERE node_id=? AND instance_id=? AND state IN ('pending','failed')")
       .all(nodeId, instanceId) as PendingRow[]
     const stale = rows.filter((row) => scopeSessionIds.has(row.session_id) && !activeIdentities.has(row.identity))
     this.db.transaction(() => {
@@ -552,20 +556,22 @@ export class HubStore {
   }
 
   cleanup(now = Date.now(), telemetryRetentionMs = 24 * 60 * 60_000) {
-    const expired = this.db
+    const expiredActions = this.db
       .query(
         "SELECT pending.* FROM pending JOIN actions ON actions.pending_identity=pending.identity WHERE pending.state='dispatching' AND actions.state='dispatching' AND actions.expires_at<=?",
       )
+      .all(now) as PendingRow[]
+    const expiredPending = this.db
+      .query("SELECT * FROM pending WHERE state IN ('pending','failed') AND expires_at<=?")
       .all(now) as PendingRow[]
     this.db.transaction(() => {
       this.db
         .query("UPDATE actions SET state='expired',updated_at=? WHERE state='dispatching' AND expires_at<=?")
         .run(now, now)
-      this.db
-        .query(
-          "UPDATE pending SET state='expired',updated_at=? WHERE state='dispatching' AND identity IN (SELECT pending_identity FROM actions WHERE state='expired')",
-        )
-        .run(now)
+      for (const row of expiredActions)
+        this.db
+          .query("UPDATE pending SET state='expired',updated_at=? WHERE state='dispatching' AND identity=?")
+          .run(now, row.identity)
     })()
     this.db
       .query("UPDATE pending SET state='expired',updated_at=? WHERE state IN ('pending','failed') AND expires_at<=?")
@@ -589,7 +595,7 @@ export class HubStore {
         .query("DELETE FROM pending WHERE updated_at<? AND state NOT IN ('pending','dispatching','failed')")
         .run(retention)
     })()
-    return expired
+    return [...new Map([...expiredActions, ...expiredPending].map((row) => [row.identity, row])).values()]
   }
 
   setMuted(scope: "chat" | "node" | "project" | "session", scopeId: string, muted: boolean) {

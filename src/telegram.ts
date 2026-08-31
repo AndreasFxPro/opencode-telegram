@@ -1,5 +1,12 @@
 import type { Config } from "./config.ts"
-import type { BridgeEvent, PermissionAsked, QuestionAsked, Role, SessionTelemetry } from "./protocol.ts"
+import type {
+  BridgeEvent,
+  PermissionAsked,
+  QuestionAsked,
+  Role,
+  SessionTelemetry,
+  TelemetryActivity,
+} from "./protocol.ts"
 import type { HubStore, PendingRow } from "./store.ts"
 import { clip, createLogger, escapeHtml, randomId, sleep } from "./util.ts"
 import { PROTOCOL_VERSION, VERSION } from "./version.ts"
@@ -21,9 +28,10 @@ type TelegramUpdate = { update_id: number; message?: TelegramMessage; callback_q
 class TelegramApiError extends Error {
   constructor(
     readonly code: number,
-    description: string,
+    readonly method: string,
+    readonly description: string,
   ) {
-    super(`Telegram API ${code}: ${description}`)
+    super(`Telegram API ${code}: ${method}: ${description}`)
   }
 }
 
@@ -72,10 +80,51 @@ type DashboardView = {
   page: number
   selectedKey?: string
   mode: "detail" | "activity" | "todos"
+  contentPage: number
+  expanded: boolean
+  rich: boolean
   expiresAt: number
 }
 
 type InlineKeyboard = Array<Array<{ text: string; callback_data: string }>>
+type RichTableCell = {
+  text: string
+  is_header?: true
+  align: "left" | "center" | "right"
+  valign: "top" | "middle" | "bottom"
+}
+type InputRichBlock =
+  | { type: "heading"; text: string; size: 1 | 2 | 3 | 4 | 5 | 6 }
+  | { type: "paragraph"; text: string }
+  | { type: "pre"; text: string; language?: string }
+  | { type: "details"; summary: string; blocks: InputRichBlock[]; is_open?: true }
+  | { type: "expandable_blockquote"; text: string; credit?: string }
+  | {
+      type: "table"
+      cells: RichTableCell[][]
+      is_bordered?: true
+      is_striped?: true
+      is_compact?: true
+      caption?: string
+    }
+type DashboardPresentation = {
+  text: string
+  richMessage: { blocks: InputRichBlock[]; skip_entity_detection: true }
+  keyboard: InlineKeyboard
+}
+
+function richCell(text: unknown, isHeader = false, align: RichTableCell["align"] = "left"): RichTableCell {
+  return {
+    text: String(text ?? ""),
+    ...(isHeader ? { is_header: true as const } : {}),
+    align,
+    valign: "top",
+  }
+}
+
+function richRows(rows: Array<[string, unknown]>) {
+  return rows.map(([label, value]) => [richCell(label, true), richCell(value)])
+}
 
 function roleAllows(role: Role, required: Role) {
   const rank: Record<Role, number> = { viewer: 0, approver: 1, owner: 2 }
@@ -94,6 +143,10 @@ function eventContext(event: BridgeEvent) {
   if (event.context?.agent || event.context?.model)
     parts.push(`🤖 ${escapeHtml(clip([event.context.agent, event.context.model].filter(Boolean).join(" · "), 120))}`)
   if (event.sessionId) parts.push(`🔑 <code>${escapeHtml(event.sessionId.slice(0, 16))}</code>`)
+  if ("requestId" in event)
+    parts.push(
+      `Ref: <code>${escapeHtml(event.requestId.slice(-12))}</code> · origin <code>${escapeHtml(event.instanceId.slice(-8))}</code>`,
+    )
   return parts.join("\n")
 }
 
@@ -158,7 +211,9 @@ export class TelegramGateway {
   private readonly log = createLogger("telegram")
   private readonly controller = new AbortController()
   private readonly dashboardViews = new Map<string, DashboardView>()
+  private readonly pendingNotifications = new Set<string>()
   private botUsername = ""
+  private richMessagesSupported: boolean | undefined
 
   constructor(
     private readonly config: Config,
@@ -179,7 +234,7 @@ export class TelegramGateway {
     if (!body.ok) {
       if (body.error_code === 429 && body.parameters?.retry_after)
         await sleep(body.parameters.retry_after * 1000, this.controller.signal)
-      throw new TelegramApiError(body.error_code, `${method}: ${body.description}`)
+      throw new TelegramApiError(body.error_code, method, body.description)
     }
     return body.result
   }
@@ -251,6 +306,7 @@ export class TelegramGateway {
 
   async notifyPending(row: PendingRow) {
     const existing = this.store.telegramMessages(row.identity)
+    const destinations = new Set(existing.map((message) => `${message.chat_id}:${message.thread_id ?? ""}`))
     const event = this.visibleEvent(JSON.parse(row.event_json) as PermissionAsked | QuestionAsked)
     const draft = row.kind === "question" ? questionDraft(row) : undefined
     const text =
@@ -259,18 +315,25 @@ export class TelegramGateway {
         : renderQuestion(event as QuestionAsked, undefined, draft?.index, draft?.answers)
     for (const auth of this.config.telegram.authorizedChats) {
       if (this.store.isMuted("chat", String(auth.id))) continue
-      if (existing.some((message) => message.chat_id === auth.id && message.thread_id === (auth.threadId ?? null)))
-        continue
-      const result = await this.api<TelegramMessage>("sendMessage", {
-        chat_id: auth.id,
-        ...(auth.threadId ? { message_thread_id: auth.threadId } : {}),
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        disable_notification: false,
-        reply_markup: { inline_keyboard: this.keyboard(row) },
-      })
-      this.store.setTelegramMessage(row.identity, auth.id, result.message_id, auth.threadId)
+      const destination = `${auth.id}:${auth.threadId ?? ""}`
+      const notification = `${row.identity}:${destination}`
+      if (destinations.has(destination) || this.pendingNotifications.has(notification)) continue
+      this.pendingNotifications.add(notification)
+      try {
+        const result = await this.api<TelegramMessage>("sendMessage", {
+          chat_id: auth.id,
+          ...(auth.threadId ? { message_thread_id: auth.threadId } : {}),
+          text,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          disable_notification: false,
+          reply_markup: { inline_keyboard: this.keyboard(row) },
+        })
+        this.store.setTelegramMessage(row.identity, auth.id, result.message_id, auth.threadId)
+        destinations.add(destination)
+      } finally {
+        this.pendingNotifications.delete(notification)
+      }
     }
   }
 
@@ -399,7 +462,35 @@ export class TelegramGateway {
     return `${Math.floor(seconds / 3600)}h ago`
   }
 
-  private dashboardPresentation(view: DashboardView, snapshot: DashboardSnapshot) {
+  private dashboardTimestamp(timestamp: number | undefined) {
+    return timestamp ? new Date(timestamp).toISOString().replace("T", " ").replace(".000Z", " UTC") : "unknown"
+  }
+
+  private dashboardDuration(activity: TelemetryActivity) {
+    if (activity.startedAt === undefined || activity.endedAt === undefined) return "unknown"
+    const milliseconds = Math.max(0, activity.endedAt - activity.startedAt)
+    return milliseconds < 1000 ? `${milliseconds}ms` : `${(milliseconds / 1000).toFixed(1)}s`
+  }
+
+  private dashboardActivitySymbol(activity: TelemetryActivity) {
+    if (activity.status === "error" || activity.type === "retry") return "!"
+    if (activity.status === "pending" || activity.status === "running") return "~"
+    if (activity.type === "thought") return "?"
+    return "+"
+  }
+
+  private dashboardRichUnsupported(error: unknown) {
+    return (
+      error instanceof TelegramApiError &&
+      (error.code === 404 ||
+        (error.code === 400 &&
+          /(?:method not found|unknown method|rich[ _-]?message.{0,40}(?:unsupported|unknown)|(?:unsupported|unknown).{0,40}rich[ _-]?message)/i.test(
+            error.description,
+          )))
+    )
+  }
+
+  private dashboardPresentation(view: DashboardView, snapshot: DashboardSnapshot): DashboardPresentation {
     const sessions = new Map(snapshot.sessions.map((session) => [session.key, session]))
     const availableKeys = view.keys.filter((key) => sessions.has(key))
     const nextKeys = [
@@ -441,55 +532,211 @@ export class TelegramGateway {
       const text = view.keys.length
         ? `<b>OpenCode dashboard</b> · read-only\n\nNodes: <b>${totals.connectedNodes}/${totals.nodes}</b> · Sessions: <b>${totals.sessions}</b> · Running: <b>${totals.busy}</b>\nPending: <b>${totals.pending}</b> · Cost: <b>$${totals.cost.toFixed(3)}</b>\n\nSelect a session. Updated ${this.dashboardAge(snapshot.generatedAt)}.`
         : `<b>OpenCode dashboard</b> · read-only\n\nNo retained session telemetry is currently available.\n\nUpdated ${this.dashboardAge(snapshot.generatedAt)}.`
-      return { text, keyboard }
+      const blocks: InputRichBlock[] = [
+        { type: "heading", text: "OpenCode dashboard", size: 2 },
+        { type: "paragraph", text: "Read-only telemetry" },
+        {
+          type: "table",
+          caption: "Hub snapshot",
+          is_bordered: true,
+          is_compact: true,
+          cells: richRows([
+            ["Nodes", `${totals.connectedNodes}/${totals.nodes}`],
+            ["Sessions", totals.sessions],
+            ["Running", totals.busy],
+            ["Pending", totals.pending],
+            ["Cost", `$${totals.cost.toFixed(3)}`],
+          ]),
+        },
+        {
+          type: "paragraph",
+          text: view.keys.length
+            ? `Select a session below. Updated ${this.dashboardAge(snapshot.generatedAt)}.`
+            : `No retained session telemetry is currently available. Updated ${this.dashboardAge(snapshot.generatedAt)}.`,
+        },
+      ]
+      return { text, richMessage: { blocks, skip_entity_detection: true }, keyboard }
     }
     if (!selected)
       return {
         text: "<b>Session unavailable</b>\n\nIt expired or is no longer retained.",
+        richMessage: {
+          blocks: [
+            { type: "heading", text: "Session unavailable", size: 2 },
+            { type: "paragraph", text: "It expired or is no longer retained." },
+          ],
+          skip_entity_detection: true,
+        },
         keyboard: [
           [{ text: "← Sessions", callback_data: this.dashboardData(view, "l") }],
           [{ text: "↻ Refresh", callback_data: this.dashboardData(view, "r") }],
         ] satisfies InlineKeyboard,
       }
-    const title = escapeHtml(clip(selected.title || selected.sessionId, 80))
+    const titleText = clip(selected.title || selected.sessionId, 120)
+    const title = escapeHtml(clip(titleText, 80))
+    const effectiveStatus = selected.connected ? selected.status : "offline"
+    const state = !selected.connected ? "○" : selected.status === "busy" ? "◐" : "●"
+    const model = [selected.provider, selected.model].filter(Boolean).join("/") || "unknown"
     let text = ""
+    let blocks: InputRichBlock[] = []
+    let pages = 1
     if (view.mode === "activity") {
-      const activities = selected.activities.slice(-6).reverse()
+      const pageSize = view.rich ? 8 : 1
+      const activities = [...selected.activities].reverse()
+      pages = Math.max(1, Math.ceil(activities.length / pageSize))
+      view.contentPage = Math.min(Math.max(0, view.contentPage), pages - 1)
+      const pageActivities = activities.slice(view.contentPage * pageSize, (view.contentPage + 1) * pageSize)
       const heading = `<b>Activity</b> · ${title}`
-      const blocks: string[] = []
-      for (const activity of activities) {
-        const block = `<b>${escapeHtml(clip(activity.title, 60))}</b>${activity.status ? ` · ${escapeHtml(clip(activity.status, 32))}` : ""}${activity.detail ? `\n<code>${escapeHtml(clip(activity.detail, 220))}</code>` : ""}`
-        if (`${heading}\n\n${[...blocks, block].join("\n\n")}`.length > 3600) break
-        blocks.push(block)
+      const fallbackBlocks: string[] = []
+      blocks = [
+        { type: "heading", text: `Activity · ${titleText}`, size: 2 },
+        {
+          type: "paragraph",
+          text: `${selected.activities.length} retained · newest first · page ${view.contentPage + 1}/${pages}`,
+        },
+      ]
+      for (const activity of pageActivities) {
+        const symbol = this.dashboardActivitySymbol(activity)
+        const summary = `${symbol} ${clip(activity.title, 180)}${activity.status ? ` · ${clip(activity.status, 48)}` : ""}`
+        const metadata = [
+          `Type: ${activity.type}`,
+          `Status: ${activity.status ?? "unknown"}`,
+          `Started: ${this.dashboardTimestamp(activity.startedAt)}`,
+          `Duration: ${this.dashboardDuration(activity)}`,
+        ].join("\n")
+        blocks.push({
+          type: "details",
+          summary,
+          blocks: [
+            { type: "paragraph", text: metadata },
+            activity.detail
+              ? { type: "pre", text: activity.detail }
+              : { type: "paragraph", text: "No detail was captured for this activity." },
+          ],
+          ...(view.expanded ? { is_open: true as const } : {}),
+        })
+        const detail = activity.detail ? escapeHtml(clip(activity.detail, view.expanded ? 600 : 220)) : ""
+        const fallback = `<b>${escapeHtml(clip(activity.title, 80))}</b>${activity.status ? ` · ${escapeHtml(clip(activity.status, 32))}` : ""}${detail ? `\n<code>${detail}</code>` : ""}`
+        if (`${heading}\n\n${[...fallbackBlocks, fallback].join("\n\n")}`.length <= 3900) fallbackBlocks.push(fallback)
       }
-      text = `${heading}\n\n${blocks.join("\n\n") || "No captured activity."}`
+      if (!pageActivities.length) blocks.push({ type: "paragraph", text: "No captured activity." })
+      text = `${heading}\n\n${fallbackBlocks.join("\n\n") || "No captured activity."}`
     } else if (view.mode === "todos") {
+      const pageSize = view.rich ? 12 : 1
+      pages = Math.max(1, Math.ceil(selected.todos.length / pageSize))
+      view.contentPage = Math.min(Math.max(0, view.contentPage), pages - 1)
+      const todos = selected.todos.slice(view.contentPage * pageSize, (view.contentPage + 1) * pageSize)
       const heading = `<b>Todos</b> · ${title}`
       const lines: string[] = []
-      for (const todo of selected.todos.slice(0, 12)) {
-        const line = `${todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "◐" : "○"} ${escapeHtml(clip(todo.content, 240))}`
+      blocks = [
+        { type: "heading", text: `Todos · ${titleText}`, size: 2 },
+        {
+          type: "paragraph",
+          text: `${selected.todos.length} retained · page ${view.contentPage + 1}/${pages}`,
+        },
+      ]
+      for (const todo of todos) {
+        const symbol = todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "◐" : "○"
+        const line = `${symbol} ${escapeHtml(clip(todo.content, 600))}`
         if (`${heading}\n\n${[...lines, line].join("\n")}`.length > 3600) break
         lines.push(line)
+        blocks.push({
+          type: "paragraph",
+          text: `${symbol} ${todo.content}\nStatus: ${todo.status} · Priority: ${todo.priority}`,
+        })
       }
+      if (!todos.length) blocks.push({ type: "paragraph", text: "No captured todos." })
       text = `${heading}\n\n${lines.join("\n") || "No captured todos."}`
     } else {
       const tokens = selected.tokens
-      const model = [selected.provider, selected.model].filter(Boolean).join("/") || "unknown"
-      const effectiveStatus = selected.connected ? selected.status : "offline"
-      text = `<b>${title}</b>\n\n${!selected.connected ? "○" : selected.status === "busy" ? "◐" : "●"} <b>${escapeHtml(effectiveStatus)}</b> · ${escapeHtml(clip(selected.nodeName, 60))}\nProject: <code>${escapeHtml(clip(selected.project, 60))}</code>${selected.directory ? `\nPath: <code>${escapeHtml(clip(selected.directory, 100))}</code>` : ""}\nAgent: <code>${escapeHtml(clip(selected.agent || "unknown", 40))}</code>\nModel: <code>${escapeHtml(clip(model, 60))}</code>\n\nTokens: <b>${Math.round(tokens.input + tokens.output).toLocaleString("en-US")}</b> · In ${Math.round(tokens.input).toLocaleString("en-US")} · Out ${Math.round(tokens.output).toLocaleString("en-US")}\nCache read: ${Math.round(tokens.cacheRead).toLocaleString("en-US")} · Reasoning: ${Math.round(tokens.reasoning).toLocaleString("en-US")}\nCost: <b>$${selected.cost.toFixed(4)}</b> · Capture: <code>${selected.capture}</code>\nUpdated ${this.dashboardAge(selected.updatedAt)}.`
+      const totalTokens = Math.round(tokens.input + tokens.output).toLocaleString("en-US")
+      text = `<b>${title}</b>\n\n${state} <b>${escapeHtml(effectiveStatus)}</b> · ${escapeHtml(clip(selected.nodeName, 60))}\nProject: <code>${escapeHtml(clip(selected.project, 60))}</code>${selected.directory ? `\nPath: <code>${escapeHtml(clip(selected.directory, 100))}</code>` : ""}\nAgent: <code>${escapeHtml(clip(selected.agent || "unknown", 40))}</code>\nModel: <code>${escapeHtml(clip(model, 60))}</code>\n\nTokens: <b>${totalTokens}</b> · In ${Math.round(tokens.input).toLocaleString("en-US")} · Out ${Math.round(tokens.output).toLocaleString("en-US")}\nCache read: ${Math.round(tokens.cacheRead).toLocaleString("en-US")} · Cache write: ${Math.round(tokens.cacheWrite).toLocaleString("en-US")}\nReasoning: ${Math.round(tokens.reasoning).toLocaleString("en-US")} · Cost: <b>$${selected.cost.toFixed(4)}</b>\nCapture: <code>${selected.capture}</code> · Updated ${this.dashboardAge(selected.updatedAt)}.`
+      const identifiers = [
+        `Session: ${selected.sessionId}`,
+        ...(selected.parentId ? [`Parent: ${selected.parentId}`] : []),
+        `Instance: ${selected.instanceId}`,
+        `Node: ${selected.nodeId}`,
+        ...(selected.directory ? [`Path: ${selected.directory}`] : []),
+      ].join("\n")
+      blocks = [
+        { type: "heading", text: titleText, size: 2 },
+        { type: "paragraph", text: `${state} ${effectiveStatus} · ${selected.nodeName}` },
+        {
+          type: "table",
+          caption: "Session",
+          is_bordered: true,
+          is_compact: true,
+          cells: richRows([
+            ["Project", selected.project],
+            ["Agent", selected.agent || "unknown"],
+            ["Model", model],
+            ["Capture", selected.capture],
+            ["Updated", `${this.dashboardAge(selected.updatedAt)} · ${this.dashboardTimestamp(selected.updatedAt)}`],
+          ]),
+        },
+        {
+          type: "table",
+          caption: "Usage",
+          is_bordered: true,
+          is_striped: true,
+          is_compact: true,
+          cells: richRows([
+            ["Tokens", totalTokens],
+            ["Input", Math.round(tokens.input).toLocaleString("en-US")],
+            ["Output", Math.round(tokens.output).toLocaleString("en-US")],
+            ["Reasoning", Math.round(tokens.reasoning).toLocaleString("en-US")],
+            ["Cache read", Math.round(tokens.cacheRead).toLocaleString("en-US")],
+            ["Cache write", Math.round(tokens.cacheWrite).toLocaleString("en-US")],
+            ["Cost", `$${selected.cost.toFixed(4)}`],
+          ]),
+        },
+        {
+          type: "details",
+          summary: "Identifiers and path",
+          blocks: [{ type: "pre", text: identifiers }],
+        },
+      ]
+      const latest = selected.activities.at(-1)
+      if (latest)
+        blocks.push({
+          type: "details",
+          summary: `Latest · ${clip(latest.title, 180)}`,
+          blocks: [
+            {
+              type: "paragraph",
+              text: `Type: ${latest.type} · Status: ${latest.status ?? "unknown"} · Duration: ${this.dashboardDuration(latest)}`,
+            },
+            latest.detail
+              ? { type: "pre", text: latest.detail }
+              : { type: "paragraph", text: "No detail was captured for this activity." },
+          ],
+        })
     }
     const keyboard: InlineKeyboard = [
       [
         { text: `Activity ${selected.activities.length}`, callback_data: this.dashboardData(view, "a") },
         { text: `Todos ${selected.todos.length}`, callback_data: this.dashboardData(view, "t") },
       ],
-      [
+    ]
+    if (view.mode !== "detail" && pages > 1)
+      keyboard.push([
+        { text: "←", callback_data: this.dashboardData(view, "x", Math.max(0, view.contentPage - 1)) },
+        { text: `${view.contentPage + 1}/${pages}`, callback_data: this.dashboardData(view, "x", view.contentPage) },
+        { text: "→", callback_data: this.dashboardData(view, "x", Math.min(pages - 1, view.contentPage + 1)) },
+      ])
+    if (view.mode === "activity")
+      keyboard.push([
+        { text: view.expanded ? "Collapse" : "Show full", callback_data: this.dashboardData(view, "e") },
         { text: "Overview", callback_data: this.dashboardData(view, "d") },
         { text: "↻ Refresh", callback_data: this.dashboardData(view, "r") },
-      ],
-      [{ text: "← Sessions", callback_data: this.dashboardData(view, "l") }],
-    ]
-    return { text, keyboard }
+      ])
+    else
+      keyboard.push([
+        { text: "Overview", callback_data: this.dashboardData(view, "d") },
+        { text: "↻ Refresh", callback_data: this.dashboardData(view, "r") },
+      ])
+    keyboard.push([{ text: "← Sessions", callback_data: this.dashboardData(view, "l") }])
+    return { text, richMessage: { blocks, skip_entity_detection: true }, keyboard }
   }
 
   private async sendDashboard(message: TelegramMessage) {
@@ -506,10 +753,31 @@ export class TelegramGateway {
       revision: 0,
       page: 0,
       mode: "detail",
+      contentPage: 0,
+      expanded: false,
+      rich: this.richMessagesSupported !== false,
       expiresAt: Date.now() + 30 * 60_000,
     }
-    const presentation = this.dashboardPresentation(view, snapshot)
-    const sent = await this.api<TelegramMessage>("sendMessage", {
+    let presentation = this.dashboardPresentation(view, snapshot)
+    let sent: TelegramMessage | undefined
+    if (view.rich) {
+      try {
+        sent = await this.api<TelegramMessage>("sendRichMessage", {
+          chat_id: message.chat.id,
+          ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
+          rich_message: presentation.richMessage,
+          reply_markup: { inline_keyboard: presentation.keyboard },
+        })
+        this.richMessagesSupported = true
+      } catch (error) {
+        if (!this.dashboardRichUnsupported(error)) throw error
+        this.richMessagesSupported = false
+        view.rich = false
+        presentation = this.dashboardPresentation(view, snapshot)
+        this.log.warn("rich Telegram dashboards unavailable; using HTML fallback", { error })
+      }
+    }
+    sent ??= await this.api<TelegramMessage>("sendMessage", {
       chat_id: message.chat.id,
       ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
       text: presentation.text,
@@ -551,6 +819,8 @@ export class TelegramGateway {
       revision: view.revision,
       page: view.page,
       mode: view.mode,
+      contentPage: view.contentPage,
+      expanded: view.expanded,
       selectedKey: view.selectedKey,
     }
     const operation = parts[3]
@@ -558,15 +828,30 @@ export class TelegramGateway {
     if (operation === "l") {
       delete view.selectedKey
       view.mode = "detail"
+      view.contentPage = 0
+      view.expanded = false
     } else if (operation === "p") view.page = Math.max(0, Number(parts[4]) || 0)
     else if (operation === "o") {
       const key = view.keys[Number(parts[4])]
       if (key) view.selectedKey = key
       else delete view.selectedKey
       view.mode = "detail"
-    } else if (operation === "a") view.mode = "activity"
-    else if (operation === "t") view.mode = "todos"
-    else if (operation === "d") view.mode = "detail"
+      view.contentPage = 0
+      view.expanded = false
+    } else if (operation === "a") {
+      view.mode = "activity"
+      view.contentPage = 0
+      view.expanded = false
+    } else if (operation === "t") {
+      view.mode = "todos"
+      view.contentPage = 0
+      view.expanded = false
+    } else if (operation === "d") {
+      view.mode = "detail"
+      view.contentPage = 0
+      view.expanded = false
+    } else if (operation === "x" && view.mode !== "detail") view.contentPage = Math.max(0, Number(parts[4]) || 0)
+    else if (operation === "e" && view.mode === "activity") view.expanded = !view.expanded
     else if (operation === "r") {
       snapshot = this.hub.dashboardSnapshot()
       view.keys = snapshot.sessions.map((session) => session.key)
@@ -578,28 +863,61 @@ export class TelegramGateway {
       return
     }
     snapshot ??= this.hub.dashboardSnapshot()
-    const presentation = this.dashboardPresentation(view, snapshot)
+    let presentation = this.dashboardPresentation(view, snapshot)
     try {
-      await this.api("editMessageText", {
-        chat_id: chatId,
-        message_id: message.message_id,
-        text: presentation.text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: presentation.keyboard },
-      })
+      if (view.rich) {
+        try {
+          await this.api("editMessageText", {
+            chat_id: chatId,
+            message_id: message.message_id,
+            rich_message: presentation.richMessage,
+            reply_markup: { inline_keyboard: presentation.keyboard },
+          })
+        } catch (error) {
+          if (!this.dashboardRichUnsupported(error)) throw error
+          this.richMessagesSupported = false
+          view.rich = false
+          presentation = this.dashboardPresentation(view, snapshot)
+          this.log.warn("rich Telegram dashboard edit unavailable; using HTML fallback", { error })
+          await this.api("editMessageText", {
+            chat_id: chatId,
+            message_id: message.message_id,
+            text: presentation.text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            reply_markup: { inline_keyboard: presentation.keyboard },
+          })
+        }
+      } else
+        await this.api("editMessageText", {
+          chat_id: chatId,
+          message_id: message.message_id,
+          text: presentation.text,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: presentation.keyboard },
+        })
     } catch (error) {
       if (!String(error).toLowerCase().includes("message is not modified")) {
         view.keys = previous.keys
         view.revision = previous.revision
         view.page = previous.page
         view.mode = previous.mode
+        view.contentPage = previous.contentPage
+        view.expanded = previous.expanded
         if (previous.selectedKey) view.selectedKey = previous.selectedKey
         else delete view.selectedKey
         throw error
       }
     }
-    await this.answerCallback(callback.id, operation === "r" ? "Dashboard refreshed" : "Updated")
+    await this.answerCallback(
+      callback.id,
+      operation === "r"
+        ? "Dashboard refreshed"
+        : operation === "e" && view.expanded
+          ? "Showing full activity"
+          : "Updated",
+    )
   }
 
   private async callback(callback: TelegramCallback) {

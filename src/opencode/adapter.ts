@@ -49,7 +49,7 @@ export class OpenCodeAdapter {
 
   observeExecution(sessionId: string) {
     for (const observation of this.observations.values()) {
-      if (observation.sessionId === sessionId) observation.executionObserved = true
+      if (observation.sessionId === sessionId && observation.repliedEvent) observation.executionObserved = true
     }
   }
 
@@ -111,7 +111,7 @@ export class OpenCodeAdapter {
       observation.pendingAbsent = !this.isPending(action)
       return {
         ok: false,
-        state: observation.pendingAbsent ? "stale" : "failed",
+        state: "failed",
         detail: error instanceof Error ? error.message : String(error),
         evidence: this.evidence(observation),
       }
