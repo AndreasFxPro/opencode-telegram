@@ -4,6 +4,8 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-13
+
 ### Added
 
 - Mission Control project registry, durable work states, and operator inbox in the CLI, browser dashboard, and read-only Telegram views.

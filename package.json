@@ -1,6 +1,6 @@
 {
   "name": "opencode-telegram",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A secure Telegram notification and approval companion for OpenCode TUI",
   "type": "module",
   "license": "MIT",
