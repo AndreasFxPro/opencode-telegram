@@ -1,4 +1,5 @@
 import type { Config } from "./config.ts"
+import type { MissionControlSnapshot } from "./mission.ts"
 import type {
   BridgeEvent,
   PermissionAsked,
@@ -67,6 +68,7 @@ export type DashboardSnapshot = {
     cost: number
   }
   sessions: DashboardSession[]
+  missionControl: MissionControlSnapshot
 }
 
 type DashboardView = {
@@ -82,6 +84,19 @@ type DashboardView = {
   mode: "detail" | "activity" | "todos"
   contentPage: number
   expanded: boolean
+  rich: boolean
+  expiresAt: number
+}
+
+type MissionView = {
+  token: string
+  chatId: number
+  userId: number
+  threadId?: number
+  messageId: number
+  revision: number
+  section: "home" | "projects" | "queue" | "inbox"
+  page: number
   rich: boolean
   expiresAt: number
 }
@@ -211,6 +226,7 @@ export class TelegramGateway {
   private readonly log = createLogger("telegram")
   private readonly controller = new AbortController()
   private readonly dashboardViews = new Map<string, DashboardView>()
+  private readonly missionViews = new Map<string, MissionView>()
   private readonly pendingNotifications = new Set<string>()
   private botUsername = ""
   private richMessagesSupported: boolean | undefined
@@ -448,6 +464,12 @@ export class TelegramGateway {
       const oldest = this.dashboardViews.keys().next().value
       if (!oldest) break
       this.dashboardViews.delete(oldest)
+    }
+    for (const [token, view] of this.missionViews) if (view.expiresAt <= now) this.missionViews.delete(token)
+    while (this.missionViews.size >= 256) {
+      const oldest = this.missionViews.keys().next().value
+      if (!oldest) break
+      this.missionViews.delete(oldest)
     }
   }
 
@@ -920,7 +942,263 @@ export class TelegramGateway {
     )
   }
 
+  private missionData(view: MissionView, operation: string, value?: number) {
+    return `m:${view.token}:${view.revision}:${operation}${value === undefined ? "" : `:${value}`}`
+  }
+
+  private missionPresentation(view: MissionView, snapshot: DashboardSnapshot): DashboardPresentation {
+    const mission = snapshot.missionControl
+    const keyboard: InlineKeyboard = []
+    let text = ""
+    let blocks: InputRichBlock[] = []
+    if (view.section === "home") {
+      const totals = mission.totals
+      text = `<b>Mission Control</b> · read-only\n\nInbox: <b>${totals.inbox}</b> · Active work: <b>${totals.activeWork}</b>\nBlocked: <b>${totals.blocked}</b> · Review: <b>${totals.review}</b>\nProjects: <b>${totals.projects}</b> · Sessions: <b>${snapshot.totals.sessions}</b>\n\nUse the queue CLI to change work state.`
+      blocks = [
+        { type: "heading", text: "Mission Control", size: 2 },
+        { type: "paragraph", text: "Operator overview · read-only Telegram surface" },
+        {
+          type: "table",
+          caption: "Control plane",
+          is_bordered: true,
+          is_compact: true,
+          cells: richRows([
+            ["Inbox", totals.inbox],
+            ["Active work", totals.activeWork],
+            ["Blocked", totals.blocked],
+            ["Review", totals.review],
+            ["Projects", totals.projects],
+            ["Sessions", snapshot.totals.sessions],
+          ]),
+        },
+        { type: "paragraph", text: "Use the Mission Control CLI on the hub to add and advance work." },
+      ]
+      keyboard.push(
+        [
+          { text: `Inbox ${totals.inbox}`, callback_data: this.missionData(view, "i") },
+          { text: `Queue ${totals.activeWork}`, callback_data: this.missionData(view, "q") },
+        ],
+        [
+          { text: `Projects ${totals.projects}`, callback_data: this.missionData(view, "p") },
+          { text: "↻ Refresh", callback_data: this.missionData(view, "r") },
+        ],
+      )
+      return { text, richMessage: { blocks, skip_entity_detection: true }, keyboard }
+    }
+    const pageSize = view.rich ? 8 : 1
+    const source =
+      view.section === "projects"
+        ? mission.projects
+        : view.section === "queue"
+          ? mission.workItems.filter((work) => work.state !== "completed" && work.state !== "cancelled")
+          : mission.inbox
+    const pages = Math.max(1, Math.ceil(source.length / pageSize))
+    view.page = Math.min(Math.max(0, view.page), pages - 1)
+    const page = source.slice(view.page * pageSize, (view.page + 1) * pageSize)
+    const heading =
+      view.section === "projects" ? "Projects" : view.section === "queue" ? "Work queue" : "Operator inbox"
+    blocks = [
+      { type: "heading", text: heading, size: 2 },
+      {
+        type: "paragraph",
+        text: `${source.length} item${source.length === 1 ? "" : "s"} · page ${view.page + 1}/${pages}`,
+      },
+    ]
+    const fallback: string[] = []
+    for (const item of page) {
+      if (view.section === "projects") {
+        const project = item as (typeof mission.projects)[number]
+        blocks.push({
+          type: "details",
+          summary: `${project.priority.toUpperCase()} · ${project.name}`,
+          blocks: [
+            {
+              type: "paragraph",
+              text: `${clip(project.description || "No description", 1200)}\nActive work: ${project.activeWork} · Blocked: ${project.blockedWork} · Review: ${project.reviewWork} · Sessions: ${project.activeSessions}`,
+            },
+            ...(project.repository ? [{ type: "pre" as const, text: clip(project.repository, 512) }] : []),
+          ],
+        })
+        fallback.push(
+          `<b>${escapeHtml(project.name)}</b> · ${project.activeWork} active · ${project.blockedWork} blocked`,
+        )
+      } else if (view.section === "queue") {
+        const work = item as (typeof mission.workItems)[number]
+        blocks.push({
+          type: "details",
+          summary: `${work.priority.toUpperCase()} · ${work.state} · ${clip(work.title, 180)}`,
+          blocks: [
+            {
+              type: "paragraph",
+              text: `${work.projectName}\n${clip(work.description || "No description", 1200)}`,
+            },
+            ...(work.acceptance ? [{ type: "pre" as const, text: `Acceptance:\n${clip(work.acceptance, 1600)}` }] : []),
+            ...(work.sessionKey ? [{ type: "pre" as const, text: `Session: ${work.sessionKey}` }] : []),
+          ],
+        })
+        fallback.push(`<b>${escapeHtml(clip(work.title, 120))}</b> · ${work.state}\n${escapeHtml(work.projectName)}`)
+      } else {
+        const inbox = item as (typeof mission.inbox)[number]
+        blocks.push({
+          type: "details",
+          summary: `${inbox.state.toUpperCase()} · ${clip(inbox.title, 180)}`,
+          blocks: [
+            {
+              type: "paragraph",
+              text: `${inbox.project}${inbox.nodeName ? ` · ${inbox.nodeName}` : ""}\n${clip(inbox.summary, 1200)}`,
+            },
+            { type: "paragraph", text: "Resolve approval requests in their exact Telegram message or in OpenCode." },
+          ],
+        })
+        fallback.push(`<b>${escapeHtml(clip(inbox.title, 120))}</b> · ${inbox.state}\n${escapeHtml(inbox.project)}`)
+      }
+    }
+    if (!page.length) blocks.push({ type: "paragraph", text: `No ${heading.toLowerCase()} items.` })
+    text = `<b>${heading}</b> · ${view.page + 1}/${pages}\n\n${fallback.join("\n\n") || `No ${heading.toLowerCase()} items.`}`
+    if (pages > 1)
+      keyboard.push([
+        { text: "←", callback_data: this.missionData(view, "g", Math.max(0, view.page - 1)) },
+        { text: `${view.page + 1}/${pages}`, callback_data: this.missionData(view, "g", view.page) },
+        { text: "→", callback_data: this.missionData(view, "g", Math.min(pages - 1, view.page + 1)) },
+      ])
+    keyboard.push([
+      { text: "← Mission", callback_data: this.missionData(view, "h") },
+      { text: "↻ Refresh", callback_data: this.missionData(view, "r") },
+    ])
+    return { text, richMessage: { blocks, skip_entity_detection: true }, keyboard }
+  }
+
+  private async sendMission(message: TelegramMessage, section: MissionView["section"] = "home") {
+    if (!message.from) return
+    this.pruneDashboardViews()
+    const view: MissionView = {
+      token: randomId("mv", 8),
+      chatId: message.chat.id,
+      userId: message.from.id,
+      ...(message.message_thread_id ? { threadId: message.message_thread_id } : {}),
+      messageId: 0,
+      revision: 0,
+      section,
+      page: 0,
+      rich: this.richMessagesSupported !== false,
+      expiresAt: Date.now() + 30 * 60_000,
+    }
+    let presentation = this.missionPresentation(view, this.hub.dashboardSnapshot())
+    let sent: TelegramMessage | undefined
+    if (view.rich) {
+      try {
+        sent = await this.api<TelegramMessage>("sendRichMessage", {
+          chat_id: message.chat.id,
+          ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
+          rich_message: presentation.richMessage,
+          reply_markup: { inline_keyboard: presentation.keyboard },
+        })
+        this.richMessagesSupported = true
+      } catch (error) {
+        if (!this.dashboardRichUnsupported(error)) throw error
+        this.richMessagesSupported = false
+        view.rich = false
+        presentation = this.missionPresentation(view, this.hub.dashboardSnapshot())
+      }
+    }
+    sent ??= await this.api<TelegramMessage>("sendMessage", {
+      chat_id: message.chat.id,
+      ...(message.message_thread_id ? { message_thread_id: message.message_thread_id } : {}),
+      text: presentation.text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: presentation.keyboard },
+    })
+    view.messageId = sent.message_id
+    this.missionViews.set(view.token, view)
+  }
+
+  private async missionCallback(callback: TelegramCallback) {
+    const message = callback.message
+    const parts = callback.data?.split(":") ?? []
+    const view = parts[1] ? this.missionViews.get(parts[1]) : undefined
+    if (
+      !message ||
+      !view ||
+      view.expiresAt <= Date.now() ||
+      !this.authorized(message.chat.id, callback.from.id, message.message_thread_id, "viewer") ||
+      view.chatId !== message.chat.id ||
+      view.userId !== callback.from.id ||
+      view.threadId !== message.message_thread_id ||
+      view.messageId !== message.message_id
+    ) {
+      await this.answerCallback(callback.id, "Mission Control expired or is not yours. Run /mission again.", true)
+      return
+    }
+    if (Number(parts[2]) !== view.revision) {
+      await this.answerCallback(callback.id, "Mission Control changed. Use the latest buttons.", true)
+      return
+    }
+    const previous = { section: view.section, page: view.page, revision: view.revision }
+    const operation = parts[3]
+    if (operation === "h") view.section = "home"
+    else if (operation === "p") view.section = "projects"
+    else if (operation === "q") view.section = "queue"
+    else if (operation === "i") view.section = "inbox"
+    else if (operation === "g") view.page = Math.max(0, Number(parts[4]) || 0)
+    else if (operation === "r") view.revision++
+    else {
+      await this.answerCallback(callback.id, "Invalid Mission Control action.", true)
+      return
+    }
+    if (["h", "p", "q", "i"].includes(operation ?? "")) view.page = 0
+    let presentation = this.missionPresentation(view, this.hub.dashboardSnapshot())
+    try {
+      if (view.rich)
+        await this.api("editMessageText", {
+          chat_id: message.chat.id,
+          message_id: message.message_id,
+          rich_message: presentation.richMessage,
+          reply_markup: { inline_keyboard: presentation.keyboard },
+        })
+      else
+        await this.api("editMessageText", {
+          chat_id: message.chat.id,
+          message_id: message.message_id,
+          text: presentation.text,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: presentation.keyboard },
+        })
+    } catch (error) {
+      if (view.rich && this.dashboardRichUnsupported(error)) {
+        this.richMessagesSupported = false
+        view.rich = false
+        presentation = this.missionPresentation(view, this.hub.dashboardSnapshot())
+        try {
+          await this.api("editMessageText", {
+            chat_id: message.chat.id,
+            message_id: message.message_id,
+            text: presentation.text,
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: presentation.keyboard },
+          })
+        } catch (fallbackError) {
+          view.section = previous.section
+          view.page = previous.page
+          view.revision = previous.revision
+          throw fallbackError
+        }
+      } else if (!String(error).toLowerCase().includes("message is not modified")) {
+        view.section = previous.section
+        view.page = previous.page
+        view.revision = previous.revision
+        throw error
+      }
+    }
+    await this.answerCallback(callback.id, operation === "r" ? "Mission Control refreshed" : "Updated")
+  }
+
   private async callback(callback: TelegramCallback) {
+    if (callback.data?.startsWith("m:")) {
+      await this.missionCallback(callback)
+      return
+    }
     if (callback.data?.startsWith("v:")) {
       await this.dashboardCallback(callback)
       return
@@ -1065,6 +1343,14 @@ export class TelegramGateway {
     const text = message.text?.trim() ?? ""
     if (text.startsWith("/")) {
       const command = text.split(/\s/, 1)[0]?.split("@")[0]
+      if (command === "/mission" || command === "/control") {
+        await this.sendMission(message)
+        return
+      }
+      if (command === "/projects" || command === "/queue" || command === "/inbox") {
+        await this.sendMission(message, command === "/projects" ? "projects" : command === "/queue" ? "queue" : "inbox")
+        return
+      }
       if (command === "/dashboard" || command === "/sessions") {
         await this.sendDashboard(message)
         return
@@ -1074,7 +1360,8 @@ export class TelegramGateway {
       const pending = this.store.listPending()
       let response = ""
       if (command === "/start" || command === "/help")
-        response = "<b>OpenCode Telegram</b>\n\n/dashboard /status /nodes /sessions /pending /whoami /help"
+        response =
+          "<b>OpenCode Telegram</b>\n\n/mission /inbox /queue /projects /sessions /status /nodes /pending /whoami /help"
       else if (command === "/status")
         response = `<b>Healthy</b>\nVersion: <code>${VERSION}</code>\nProtocol: <code>${PROTOCOL_VERSION}</code>\nUptime: ${Math.round(this.hub.uptimeMs() / 1000)}s\nConnected nodes: ${this.hub.connectedNodeIds().length}\nActive TUIs: ${tuis.filter((tui) => tui.connected).length}\nPending: ${pending.length}`
       else if (command === "/nodes")

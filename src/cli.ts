@@ -15,6 +15,7 @@ import {
   splitListen,
 } from "./config.ts"
 import { Hub } from "./hub.ts"
+import { MissionPrioritySchema, MissionWorkStateSchema } from "./mission.ts"
 import { NodeService } from "./node.ts"
 import { HubStore } from "./store.ts"
 import { randomId } from "./util.ts"
@@ -392,6 +393,120 @@ function dashboardAdmin() {
   throw new Error("Usage: dashboard enable|disable|token|rotate|capture metadata|activity|full")
 }
 
+function missionAdmin() {
+  const config = loadConfig()
+  if (config.mode === "node")
+    throw new Error("Mission Control administration is available on the hub or standalone host")
+  const resource = args[1]
+  const operation = args[2]
+  const store = new HubStore(join(dataDir(config), "hub.db"))
+  try {
+    if (resource === "project") {
+      if (operation === "add") {
+        const key = args[3]
+        const name = args[4]
+        if (!key || !name)
+          throw new Error(
+            "Usage: mission project add <key> <name> [--description <text>] [--repository <value>] [--priority urgent|high|normal|low]",
+          )
+        const project = store.createMissionProject({
+          key,
+          name,
+          description: option("--description") ?? "",
+          ...(option("--repository") ? { repository: option("--repository") } : {}),
+          priority: MissionPrioritySchema.parse(option("--priority") ?? "normal"),
+        })
+        console.log(has("--json") ? JSON.stringify(project, null, 2) : `Created ${project.key} (${project.id})`)
+        return
+      }
+      if (operation === "list") {
+        const projects = store.listMissionProjects(has("--all"))
+        if (has("--json")) console.log(JSON.stringify(projects, null, 2))
+        else if (!projects.length) console.log("No Mission Control projects.")
+        else
+          for (const project of projects)
+            console.log(
+              `${project.priority}\t${project.archived ? "archived" : "active"}\t${project.key}\t${project.name}`,
+            )
+        return
+      }
+      if (operation === "show") {
+        const project = args[3] ? store.getMissionProject(args[3]) : undefined
+        if (!project) throw new Error("Project not found")
+        console.log(JSON.stringify(project, null, 2))
+        return
+      }
+      if (operation === "archive") {
+        if (!args[3]) throw new Error("Usage: mission project archive <id|key>")
+        const project = store.archiveMissionProject(args[3])
+        console.log(`Archived ${project.key}`)
+        return
+      }
+      throw new Error("Usage: mission project add|list|show|archive")
+    }
+    if (resource === "work") {
+      if (operation === "add") {
+        const projectKey = args[3]
+        const title = args[4]
+        if (!projectKey || !title)
+          throw new Error(
+            "Usage: mission work add <project> <title> [--description <text>] [--acceptance <text>] [--priority urgent|high|normal|low]",
+          )
+        const project = store.getMissionProject(projectKey)
+        if (!project) throw new Error("Project not found")
+        const work = store.createMissionWorkItem({
+          projectId: project.id,
+          title,
+          description: option("--description") ?? "",
+          acceptance: option("--acceptance") ?? "",
+          priority: MissionPrioritySchema.parse(option("--priority") ?? "normal"),
+        })
+        console.log(has("--json") ? JSON.stringify(work, null, 2) : `Queued ${work.id}: ${work.title}`)
+        return
+      }
+      if (operation === "list") {
+        const state = option("--state")
+        const projectId = option("--project")
+        const work = store.listMissionWorkItems({
+          ...(projectId ? { projectId } : {}),
+          ...(state ? { state: MissionWorkStateSchema.parse(state) } : {}),
+          activeOnly: has("--active"),
+        })
+        if (has("--json")) console.log(JSON.stringify(work, null, 2))
+        else if (!work.length) console.log("No Mission Control work items.")
+        else
+          for (const item of work) {
+            const project = store.getMissionProject(item.project_id)
+            console.log(`${item.priority}\t${item.state}\t${item.id}\t${project?.key ?? "unknown"}\t${item.title}`)
+          }
+        return
+      }
+      if (operation === "show") {
+        const work = args[3] ? store.getMissionWorkItem(args[3]) : undefined
+        if (!work) throw new Error("Work item not found")
+        console.log(JSON.stringify(work, null, 2))
+        return
+      }
+      if (operation === "set") {
+        if (!args[3] || !args[4]) throw new Error("Usage: mission work set <id> <state>")
+        const work = store.transitionMissionWorkItem(args[3], MissionWorkStateSchema.parse(args[4]))
+        console.log(`${work.id} -> ${work.state}`)
+        return
+      }
+      if (operation === "attach") {
+        if (!args[3] || !args[4]) throw new Error("Usage: mission work attach <id> <session-key|none>")
+        const work = store.attachMissionWorkItem(args[3], args[4] === "none" ? undefined : args[4])
+        console.log(`${work.id} attached to ${work.session_key ?? "no session"}`)
+        return
+      }
+      throw new Error("Usage: mission work add|list|show|set|attach")
+    }
+    throw new Error("Usage: mission project add|list|show|archive | mission work add|list|show|set|attach")
+  } finally {
+    store.close()
+  }
+}
+
 async function fetchHealth(url: string, authorization?: string) {
   try {
     const response = await fetch(url, {
@@ -543,7 +658,7 @@ function serviceCommand(operation: string) {
 
 function help() {
   console.log(
-    `opencode-telegram ${VERSION}\n\nUsage:\n  opencode-telegram setup [standalone|hub|node]\n  opencode-telegram standalone | hub | node\n  opencode-telegram status | doctor [--json] | test | logs\n  opencode-telegram node create|list|revoke|rename\n  opencode-telegram dashboard enable|disable|token|rotate|capture\n  opencode-telegram service install|start|stop|restart|status\n  opencode-telegram config show|validate\n  opencode-telegram instructions install|uninstall\n  opencode-telegram uninstall --yes\n  opencode-telegram version\n`,
+    `opencode-telegram ${VERSION}\n\nUsage:\n  opencode-telegram setup [standalone|hub|node]\n  opencode-telegram standalone | hub | node\n  opencode-telegram status | doctor [--json] | test | logs\n  opencode-telegram node create|list|revoke|rename\n  opencode-telegram dashboard enable|disable|token|rotate|capture\n  opencode-telegram mission project add|list|show|archive\n  opencode-telegram mission work add|list|show|set|attach\n  opencode-telegram service install|start|stop|restart|status\n  opencode-telegram config show|validate\n  opencode-telegram instructions install|uninstall\n  opencode-telegram uninstall --yes\n  opencode-telegram version\n`,
   )
 }
 
@@ -553,6 +668,7 @@ async function main() {
   if (command === "node" && !["create", "list", "revoke", "rename"].includes(args[1] ?? "")) return runServices("node")
   if (command === "node") return nodeAdmin()
   if (command === "dashboard") return dashboardAdmin()
+  if (command === "mission") return missionAdmin()
   if (command === "doctor" || command === "status") return doctor()
   if (command === "service") {
     if (args[1] === "install") return serviceInstall()

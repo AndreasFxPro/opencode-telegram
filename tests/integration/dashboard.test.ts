@@ -33,6 +33,20 @@ test("dashboard serves a data-free shell and authenticates snapshots", async () 
     activities: [{ id: "activity-1", type: "thought", title: "Thought", detail: "Private detail" }],
   }
   hub.store.upsertSessionTelemetry(secrets.nodeId, meta.instanceId, telemetry)
+  const project = hub.store.createMissionProject({
+    key: "unsafe-project",
+    name: "<script>Mission</script>",
+    description: "Prioritize & verify",
+    priority: "urgent",
+  })
+  const work = hub.store.createMissionWorkItem({
+    projectId: project.id,
+    title: "Review <unsafe> work",
+    description: "Needs operator attention",
+    priority: "high",
+  })
+  hub.store.transitionMissionWorkItem(work.id, "ready")
+  hub.store.transitionMissionWorkItem(work.id, "blocked")
   hub.store.upsertSessionTelemetry(secrets.nodeId, meta.instanceId, {
     ...telemetry,
     sessionId: "session-expired",
@@ -61,7 +75,16 @@ test("dashboard serves a data-free shell and authenticates snapshots", async () 
   const response = await fetch(`${base}/v1/dashboard/snapshot`, {
     headers: { authorization: `Bearer ${secrets.dashboardToken}` },
   })
-  const body = (await response.json()) as { sessions: Array<Record<string, unknown>>; totals: { sessions: number } }
+  const body = (await response.json()) as {
+    sessions: Array<Record<string, unknown>>
+    totals: { sessions: number }
+    missionControl: {
+      totals: { projects: number; blocked: number; inbox: number }
+      projects: Array<Record<string, unknown>>
+      workItems: Array<Record<string, unknown>>
+      inbox: Array<Record<string, unknown>>
+    }
+  }
   expect(response.status).toBe(200)
   expect(body.totals.sessions).toBe(1)
   expect(body.sessions[0]).toMatchObject({
@@ -70,6 +93,10 @@ test("dashboard serves a data-free shell and authenticates snapshots", async () 
     directory: meta.directory,
     capture: "full",
   })
+  expect(body.missionControl.totals).toMatchObject({ projects: 1, blocked: 1, inbox: 1 })
+  expect(body.missionControl.projects[0]).toMatchObject({ name: "<script>Mission</script>", activeWork: 1 })
+  expect(body.missionControl.workItems[0]).toMatchObject({ title: "Review <unsafe> work", state: "blocked" })
+  expect(body.missionControl.inbox[0]).toMatchObject({ kind: "blocked_work", state: "blocked" })
   const serialized = JSON.stringify(body)
   expect(serialized).not.toContain("credential_hash")
   expect(serialized).not.toContain(secrets.nodeCredential)

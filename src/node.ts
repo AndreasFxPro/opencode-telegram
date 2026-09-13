@@ -16,6 +16,7 @@ import { backoff, createLogger, safeEqualHash, sha256, sleep } from "./util.ts"
 import { PROTOCOL_VERSION, VERSION } from "./version.ts"
 
 type Waiter = (command: ActionDispatch | undefined) => void
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024
 
 export class NodeService {
   readonly store: NodeStore
@@ -28,6 +29,9 @@ export class NodeService {
   private localServer?: Server<undefined>
   private heartbeat?: Timer
   private instanceTimer?: Timer
+  private flushTimer?: Timer
+  private eventInFlight: number | undefined
+  private resultInFlight: string | undefined
   private hubConnected = false
   private telegramReachable = false
   private telemetrySupported = false
@@ -63,6 +67,9 @@ export class NodeService {
         if (instance.seenAt < cutoff) this.disconnectInstance(instanceId)
     }, 10_000)
     void this.connectLoop()
+    // Client WebSockets have no drain callback. Retry deferred sends without
+    // retaining payloads or resending messages already awaiting an ACK.
+    this.flushTimer = setInterval(() => this.flush(), 250)
     this.log.info("local listener ready", { address: this.config.node.localListen })
   }
 
@@ -70,8 +77,9 @@ export class NodeService {
     this.controller.abort()
     if (this.heartbeat) clearInterval(this.heartbeat)
     if (this.instanceTimer) clearInterval(this.instanceTimer)
+    if (this.flushTimer) clearInterval(this.flushTimer)
     this.socket?.close(1001, "Node shutting down")
-    for (const callbacks of this.waiters.values()) for (const callback of callbacks) callback(undefined)
+    for (const callbacks of this.waiters.values()) for (const callback of [...callbacks]) callback(undefined)
     this.localServer?.stop(true)
     this.store.close()
   }
@@ -112,7 +120,7 @@ export class NodeService {
         hubConnected: this.hubConnected,
         telegramReachable: this.telegramReachable,
         activeTuis: this.instances.size,
-        queued: this.store.pending().length,
+        queued: this.store.pendingCount(),
         uptimeMs: Date.now() - this.startedAt,
       })
     }
@@ -167,21 +175,19 @@ export class NodeService {
           if (settled) return
           settled = true
           clearTimeout(timer)
+          request.signal.removeEventListener("abort", abort)
           const current = this.waiters.get(instanceId) ?? []
           const index = current.indexOf(finish)
           if (index >= 0) current.splice(index, 1)
+          if (!current.length) this.waiters.delete(instanceId)
           resolve(value)
         }
+        const abort = () => finish(undefined)
         list.push(finish)
         this.waiters.set(instanceId, list)
         timer = setTimeout(() => finish(undefined), 20_000)
-        request.signal.addEventListener(
-          "abort",
-          () => {
-            finish(undefined)
-          },
-          { once: true },
-        )
+        request.signal.addEventListener("abort", abort, { once: true })
+        if (request.signal.aborted) abort()
       })
       return Response.json({ command: command ?? null })
     }
@@ -196,15 +202,11 @@ export class NodeService {
     this.flush()
   }
 
-  private sendHub(message: unknown) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN)
-      throw new Error("Hub is offline; action result will be retried by plugin")
-    this.socket.send(JSON.stringify(message))
-  }
-
   private flush() {
     if (!this.hubConnected || !this.socket || this.socket.readyState !== WebSocket.OPEN) return
-    for (const row of this.store.pending()) {
+    this.flushResults()
+    if (this.eventInFlight !== undefined || this.socket.bufferedAmount >= MAX_BUFFERED_BYTES) return
+    for (const row of this.store.pending(1)) {
       const event = JSON.parse(row.payload_json) as BridgeEvent
       const compatibleEvent =
         event.type === "reconcile" && !this.telemetrySupported
@@ -218,25 +220,29 @@ export class NodeService {
           event: compatibleEvent,
         }),
       )
-      if (this.socket.bufferedAmount > 4 * 1024 * 1024) break
+      this.eventInFlight = row.seq
     }
-    this.flushResults()
   }
 
   private flushResults() {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return
-    for (const row of this.store.results()) this.socket.send(row.payload_json)
+    if (!this.hubConnected || !this.socket || this.socket.readyState !== WebSocket.OPEN) return
+    if (this.resultInFlight !== undefined || this.socket.bufferedAmount >= MAX_BUFFERED_BYTES) return
+    for (const row of this.store.results(1)) {
+      this.socket.send(row.payload_json)
+      this.resultInFlight = row.action_id
+    }
   }
 
   private route(action: ActionDispatch) {
     if (Date.now() >= action.expiresAt) {
-      this.sendHub({
+      this.store.completeCommand(action.actionId, {
         type: "action.result",
         actionId: action.actionId,
         ok: false,
         state: "stale",
         detail: "Action expired before local delivery",
       })
+      this.flushResults()
       return
     }
     this.store.storeCommand(action)
@@ -265,6 +271,8 @@ export class NodeService {
   private connect() {
     return new Promise<void>((resolve, reject) => {
       this.telemetrySupported = false
+      this.eventInFlight = undefined
+      this.resultInFlight = undefined
       const BunWebSocket = WebSocket as typeof WebSocket & {
         new (url: string | URL, options?: Bun.WebSocketOptions): WebSocket
       }
@@ -301,21 +309,27 @@ export class NodeService {
         try {
           const message = HubToNodeSchema.parse(JSON.parse(String(event.data)))
           if (message.type === "welcome") {
+            if (welcomed) throw new Error("Duplicate hub welcome")
             clearTimeout(timeout)
             welcomed = true
             this.hubConnected = true
             this.telegramReachable = message.telegramReachable
             this.telemetrySupported = Boolean(message.telemetry)
             this.heartbeat = setInterval(() => {
-              if (socket.readyState === WebSocket.OPEN)
+              if (socket.readyState === WebSocket.OPEN && socket.bufferedAmount < MAX_BUFFERED_BYTES)
                 socket.send(JSON.stringify({ type: "heartbeat", at: Date.now() }))
             }, message.heartbeatMs)
             this.flush()
           } else if (message.type === "ack") {
+            if (message.seq !== this.eventInFlight) return
             this.store.ack(message.seq)
+            this.eventInFlight = undefined
             this.flush()
           } else if (message.type === "action.ack") {
+            if (message.actionId !== this.resultInFlight) return
             this.store.ackResult(message.actionId)
+            this.resultInFlight = undefined
+            this.flush()
           } else if (message.type === "action.dispatch") this.route(ActionDispatchSchema.parse(message))
         } catch (error) {
           socket.close(4002, "Invalid hub message")

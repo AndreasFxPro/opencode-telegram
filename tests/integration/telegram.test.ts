@@ -21,6 +21,15 @@ function stringContentLength(value: unknown): number {
   return 0
 }
 
+function emptyMissionControl() {
+  return {
+    totals: { projects: 0, activeWork: 0, blocked: 0, review: 0, inbox: 0 },
+    projects: [],
+    workItems: [],
+    inbox: [],
+  }
+}
+
 test("fake Telegram callback dispatches one opaque action for an authorized approver", async () => {
   const temp = temporaryDirectory()
   cleanup.push(temp.remove)
@@ -66,6 +75,7 @@ test("fake Telegram callback dispatches one opaque action for an authorized appr
       generatedAt: Date.now(),
       totals: { nodes: 1, connectedNodes: 1, sessions: 0, busy: 0, pending: 1, cost: 0 },
       sessions: [],
+      missionControl: emptyMissionControl(),
     }),
     dispatch: async (pending, operation) => {
       dispatched.push({ row: pending, operation })
@@ -224,6 +234,7 @@ test("viewer navigates a read-only Telegram dashboard with opaque bound callback
           ],
         },
       ],
+      missionControl: emptyMissionControl(),
     }),
     dispatch: async () => {
       dispatches++
@@ -429,6 +440,7 @@ test("Telegram dashboard remembers an HTML fallback when rich messages are unava
       generatedAt: Date.now(),
       totals: { nodes: 0, connectedNodes: 0, sessions: 0, busy: 0, pending: 0, cost: 0 },
       sessions: [],
+      missionControl: emptyMissionControl(),
     }),
     dispatch: async () => undefined,
   }
@@ -445,12 +457,43 @@ test("Telegram dashboard remembers an HTML fallback when rich messages are unava
       update_id: 2,
       message: { message_id: 11, chat: { id: 42 }, from: { id: 42 }, text: "/sessions" },
     },
+    {
+      update_id: 3,
+      message: { message_id: 12, chat: { id: 42 }, from: { id: 42 }, text: "/mission" },
+    },
   )
-  await eventually(() => calls.filter((call) => call.method === "sendMessage").length === 2)
+  await eventually(() => calls.filter((call) => call.method === "sendMessage").length === 3)
   expect(calls.filter((call) => call.method === "sendRichMessage")).toHaveLength(1)
   for (const fallback of calls.filter((call) => call.method === "sendMessage")) {
     expect(fallback.body.parse_mode).toBe("HTML")
     expect(String(fallback.body.text).length).toBeLessThanOrEqual(4096)
     expect(fallback.body.rich_message).toBeUndefined()
   }
+  const missionMessage = calls.filter((call) => call.method === "sendMessage").at(-1)
+  expect(missionMessage?.body.text).toContain("Mission Control")
+  const keyboard = missionMessage?.body.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }
+  const callbackData = keyboard.inline_keyboard[0]?.[0]?.callback_data
+  expect(callbackData?.length).toBeLessThanOrEqual(64)
+  updates.push(
+    {
+      update_id: 4,
+      callback_query: {
+        id: "mission-wrong-user",
+        data: callbackData,
+        from: { id: 99 },
+        message: { message_id: 302, chat: { id: 42 } },
+      },
+    },
+    {
+      update_id: 5,
+      callback_query: {
+        id: "mission-authorized",
+        data: callbackData,
+        from: { id: 42 },
+        message: { message_id: 302, chat: { id: 42 } },
+      },
+    },
+  )
+  await eventually(() => store.telegramOffset() >= 5)
+  expect(calls.filter((call) => call.method === "editMessageText")).toHaveLength(1)
 })

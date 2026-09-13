@@ -8,7 +8,9 @@ The node is one per machine. Its loopback HTTP interface requires a random local
 
 The hub is one per Telegram bot. It authenticates each node separately, persists Telegram offsets and action state, authorizes Telegram roles, and owns the only long poller. SQLite transactions serialize callback admission and action transitions.
 
-The optional dashboard is embedded in the hub binary. Its static shell contains no operational data and its snapshot API requires an independent bearer token. The browser polls bounded read-only snapshots and keeps the token only in memory. Telegram exposes the same validated projection through expiring, user/message-bound inline views. Neither dashboard path dispatches node actions.
+The hub also owns Mission Control's durable project registry and work queue. Its operator inbox is a bounded projection of unresolved OpenCode requests and blocked work, rather than a second action ledger. Explicit CLI transitions use optimistic row versions and a fixed state graph.
+
+The optional dashboard is embedded in the hub binary. Its static shell contains no operational data and its snapshot API requires an independent bearer token. The browser polls bounded read-only session and Mission Control snapshots and keeps the token only in memory. Telegram exposes the same validated projection through expiring, user/message-bound inline views. Neither dashboard path dispatches node actions.
 
 TUI reconciliation may carry up to eight bounded session telemetry snapshots. Nodes strip telemetry unless the hub advertises support. The hub stores only the latest snapshot per node/session, removes telemetry from the long-lived event ledger, and applies configured retention.
 

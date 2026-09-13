@@ -11,6 +11,7 @@
 - Reconciles current TUI pending state after reconnect and edits existing Telegram messages when requests resolve locally.
 - Multiplexes many local TUIs through one node and many machines through one hub, with exactly one Telegram `getUpdates` poller.
 - Persists hub state, Telegram offsets, enrollment, callbacks, actions, message mappings, and a bounded node event spool in SQLite WAL databases.
+- Coordinates durable projects, work states, blocked items, and pending operator attention through Mission Control.
 - Keeps the bot token at the hub. Nodes and OpenCode plugins never receive it.
 
 ## Architecture
@@ -106,6 +107,20 @@ The browser keeps the token only in memory. The dashboard has no prompt, shell, 
 
 In Telegram, send `/dashboard` or `/sessions` for the same read-only telemetry. Telegram Bot API 10.3 Rich Messages provide structured usage tables, expandable activity details, `Show full`, and bounded activity/todo pagination; older Bot API servers automatically receive the clipped HTML view. Each view is bound to the initiating user, chat, topic, and bot message and expires after 30 minutes.
 
+## Mission Control
+
+Mission Control adds a hub-owned project registry, explicit work queue, and operator inbox. Create and advance work from the hub CLI:
+
+```bash
+opencode-telegram mission project add bridge "Telegram Bridge" --priority high
+opencode-telegram mission work add bridge "Ship control plane" --priority urgent
+opencode-telegram mission work list --active
+opencode-telegram mission work set wrk_example ready
+opencode-telegram mission work attach wrk_example node-id:session-id
+```
+
+The browser dashboard includes Overview, Projects, Queue, Inbox, and Sessions. Telegram commands `/mission`, `/projects`, `/queue`, and `/inbox` expose the same bounded projection. These views are read-only; state changes stay explicit in the local CLI, and OpenCode approvals stay bound to their exact approval messages. See [Mission Control](docs/MISSION_CONTROL.md) for the state graph, operating workflow, and Phase 2 launcher boundary.
+
 ## Updates
 
 Rerun the installer. It retains configuration and secrets, verifies and atomically replaces each release file, and restarts an active service:
@@ -133,7 +148,7 @@ m androidboot
 
 `Always...` opens a second screen showing the exact OpenCode-proposed rule. Wildcards receive a prominent warning. Callback data contains only a compact opaque ID and operation code.
 
-Commands: `/start`, `/help`, `/dashboard`, `/status`, `/nodes`, `/sessions`, `/pending`, `/mute`, `/unmute`, `/whoami`.
+Commands: `/start`, `/help`, `/mission`, `/projects`, `/queue`, `/inbox`, `/dashboard`, `/status`, `/nodes`, `/sessions`, `/pending`, `/mute`, `/unmute`, `/whoami`.
 
 OpenCode palette/slash commands: `/telegram-status`, `/telegram-test`, `/telegram-mute`.
 

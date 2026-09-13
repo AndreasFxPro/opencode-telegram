@@ -1,12 +1,76 @@
 import { afterEach, expect, test } from "bun:test"
 import { join } from "node:path"
+import type { ServerWebSocket } from "bun"
 import { Hub } from "../../src/hub.ts"
 import { NodeService } from "../../src/node.ts"
+import { PROTOCOL_VERSION } from "../../src/version.ts"
 import { eventually, metadata, permission, temporaryDirectory, testConfig, testSecrets } from "../helpers.ts"
 
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => {
   for (const item of cleanup.splice(0).reverse()) await item()
+})
+
+test("slow ACKs bound delivery and reconnect replays only unacknowledged messages", async () => {
+  const temp = temporaryDirectory()
+  cleanup.push(temp.remove)
+  let socket: ServerWebSocket<undefined> | undefined
+  const received: Array<{ type: string; seq?: number; actionId?: string }> = []
+  const server = Bun.serve<undefined>({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, server) {
+      if (server.upgrade(request)) return
+      return new Response("Expected WebSocket", { status: 400 })
+    },
+    websocket: {
+      message(ws, raw) {
+        const message = JSON.parse(String(raw))
+        if (message.type === "hello") {
+          socket = ws
+          ws.send(
+            JSON.stringify({
+              type: "welcome",
+              protocolVersion: PROTOCOL_VERSION,
+              heartbeatMs: 15_000,
+              telegramReachable: false,
+            }),
+          )
+        } else if (message.type !== "heartbeat") received.push(message)
+      },
+    },
+  })
+  cleanup.push(() => server.stop(true))
+  const config = testConfig(temp.path, server.port, 51000 + Math.floor(Math.random() * 500))
+  const node = new NodeService(config, testSecrets(), join(temp.path, "node.db"))
+  for (let index = 0; index < 3; index++) node.store.enqueue(permission(), 100)
+  for (const actionId of ["action-one", "action-two"])
+    node.store.completeCommand(actionId, { type: "action.result", actionId, ok: true, state: "confirmed" })
+  await node.start()
+  cleanup.push(() => node.stop())
+  await eventually(() => received.length === 2)
+  await Bun.sleep(600)
+  expect(received).toHaveLength(2)
+  socket?.send(JSON.stringify({ type: "ack", seq: 1 }))
+  socket?.send(JSON.stringify({ type: "action.ack", actionId: "action-one" }))
+  await eventually(() => received.length === 4)
+  expect(node.store.pending().map((row) => row.seq)).toEqual([2, 3])
+  const previous = socket
+  socket?.close()
+  await eventually(() => socket !== previous && received.length === 6)
+  expect(received.filter((message) => message.type === "event").map((message) => message.seq)).toEqual([1, 2, 2])
+  expect(received.filter((message) => message.type === "action.result").map((message) => message.actionId)).toEqual([
+    "action-one",
+    "action-two",
+    "action-two",
+  ])
+  // Stale ACKs must not release the current in-flight message.
+  socket?.send(JSON.stringify({ type: "ack", seq: 1 }))
+  socket?.send(JSON.stringify({ type: "ack", seq: 2 }))
+  socket?.send(JSON.stringify({ type: "action.ack", actionId: "action-two" }))
+  await eventually(() => received.length === 7)
+  socket?.send(JSON.stringify({ type: "ack", seq: 3 }))
+  await eventually(() => node.store.pendingCount() === 0 && node.store.results().length === 0)
 })
 
 test("node routes an idempotent action only to the originating TUI", async () => {
@@ -87,6 +151,42 @@ test("node routes an idempotent action only to the originating TUI", async () =>
     }),
   })
   await eventually(() => hub.store.getPending(unconfirmed.identity)?.state === "failed")
+})
+
+test("replayed completion events with new sequence numbers notify only once", async () => {
+  const temp = temporaryDirectory()
+  cleanup.push(temp.remove)
+  const offset = Math.floor(Math.random() * 400)
+  const config = testConfig(temp.path, 52000 + offset, 52500 + offset)
+  config.notifications.nodeJoin = false
+  const secrets = testSecrets()
+  const hub = new Hub(config, secrets, join(temp.path, "hub.db"))
+  let notifications = 0
+  // Exercise real protocol delivery and durable deduplication while replacing
+  // only the external Telegram side effect.
+  const internal = hub as unknown as { telegram: { notifyExecution(): Promise<void> } | undefined }
+  await hub.start()
+  internal.telegram = {
+    async notifyExecution() {
+      notifications++
+    },
+  }
+  cleanup.push(async () => {
+    internal.telegram = undefined
+    await hub.stop()
+  })
+  hub.store.ensureNode(secrets.nodeId, config.node.name, secrets.nodeCredential ?? "")
+  const node = new NodeService(config, secrets, join(temp.path, "node.db"))
+  const event = { ...permission(), type: "execution.succeeded", durationMs: 63_000 }
+  // Simulate an existing spool produced by an older node, before enqueue deduplication.
+  for (let index = 0; index < 100; index++)
+    node.store.db
+      .query("INSERT INTO spool(payload_json,kind,created_at) VALUES(?,'telemetry',?)")
+      .run(JSON.stringify(event), Date.now())
+  await node.start()
+  cleanup.push(() => node.stop())
+  await eventually(() => node.store.pendingCount() === 0)
+  expect(notifications).toBe(1)
 })
 
 test("node reports a full correctness-critical spool as retryable", async () => {

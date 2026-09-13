@@ -10,6 +10,49 @@ afterEach(() => {
 })
 
 describe("hub persistence and idempotency", () => {
+  test("persists Mission Control projects and enforces work transitions and versions", () => {
+    const temp = temporaryDirectory()
+    cleanup.push(temp.remove)
+    const path = join(temp.path, "hub.db")
+    const store = new HubStore(path)
+    expect(store.db.query("SELECT value FROM meta WHERE key='schema_version'").get()).toEqual({ value: "2" })
+    const project = store.createMissionProject({
+      key: "bridge",
+      name: "Telegram Bridge",
+      description: "Operate the bridge",
+      repository: "/srv/bridge",
+      priority: "high",
+    })
+    expect(() => store.createMissionProject({ key: "bridge", name: "Duplicate" })).toThrow("already exists")
+    const work = store.createMissionWorkItem({
+      projectId: project.id,
+      title: "Ship Mission Control",
+      description: "Expose the durable queue",
+      acceptance: "Store and views agree",
+      priority: "urgent",
+    })
+    expect(store.listMissionWorkItems({ projectId: "bridge" }).map((item) => item.id)).toEqual([work.id])
+    expect(() => store.transitionMissionWorkItem(work.id, "completed")).toThrow("Cannot transition")
+    const ready = store.transitionMissionWorkItem(work.id, "ready", "test", work.version)
+    expect(() => store.attachMissionWorkItem(work.id, "node:session", "test", work.version)).toThrow(
+      "changed concurrently",
+    )
+    const running = store.transitionMissionWorkItem(work.id, "running", "test", ready.version)
+    const attached = store.attachMissionWorkItem(work.id, "node-a:session-a", "test", running.version)
+    const review = store.transitionMissionWorkItem(work.id, "review", "test", attached.version)
+    const completed = store.transitionMissionWorkItem(work.id, "completed", "test", review.version)
+    expect(completed).toMatchObject({ state: "completed", updated_by: "test", session_key: "node-a:session-a" })
+    expect(completed.completed_at).toBeNumber()
+    expect(() => store.transitionMissionWorkItem(work.id, "running")).toThrow("Cannot transition")
+    store.close()
+
+    const reopened = new HubStore(path)
+    expect(reopened.getMissionProject("bridge")?.id).toBe(project.id)
+    expect(reopened.getMissionWorkItem(work.id)?.state).toBe("completed")
+    expect(reopened.listMissionWorkItems({ activeOnly: true })).toHaveLength(0)
+    reopened.close()
+  })
+
   test("enrollment tokens are single-use and credentials are independently revocable", () => {
     const temp = temporaryDirectory()
     cleanup.push(temp.remove)

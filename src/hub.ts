@@ -3,9 +3,11 @@ import type { Server, ServerWebSocket } from "bun"
 import type { Config, Secrets } from "./config.ts"
 import { dataDir, splitListen } from "./config.ts"
 import { dashboardApiHeaders, dashboardAsset } from "./dashboard.ts"
+import { missionPriorityRank, missionStateRank, missionWorkActive } from "./mission.ts"
 import {
   type ActionDispatch,
   type BridgeEvent,
+  BridgeEventSchema,
   HubToNodeSchema,
   NodeToHubSchema,
   SessionTelemetrySchema,
@@ -238,6 +240,119 @@ export class Hub implements HubView {
       })
       .sort((left, right) => Number(right.connected) - Number(left.connected) || right.updatedAt - left.updatedAt)
     const cost = sessions.reduce((total, session) => total + session.cost, 0)
+    const projectRows = this.store.listMissionProjects()
+    const workRows = this.store.listMissionWorkItems()
+    const projectById = new Map(projectRows.map((project) => [project.id, project]))
+    const workItems = workRows
+      .flatMap((work) => {
+        const project = projectById.get(work.project_id)
+        if (!project) return []
+        return [
+          {
+            id: work.id,
+            projectId: project.id,
+            projectKey: project.key,
+            projectName: project.name,
+            title: work.title,
+            description: work.description,
+            acceptance: work.acceptance,
+            state: work.state,
+            priority: work.priority,
+            ...(work.session_key ? { sessionKey: work.session_key } : {}),
+            createdAt: work.created_at,
+            updatedAt: work.updated_at,
+            ...(work.completed_at ? { completedAt: work.completed_at } : {}),
+            version: work.version,
+          },
+        ]
+      })
+      .sort(
+        (left, right) =>
+          missionStateRank[left.state] - missionStateRank[right.state] ||
+          missionPriorityRank[left.priority] - missionPriorityRank[right.priority] ||
+          right.updatedAt - left.updatedAt,
+      )
+    const projects = projectRows.map((project) => {
+      const projectWork = workItems.filter((work) => work.projectId === project.id)
+      const names = new Set([project.key.toLowerCase(), project.name.toLowerCase()])
+      return {
+        id: project.id,
+        key: project.key,
+        name: project.name,
+        description: project.description,
+        ...(project.repository ? { repository: project.repository } : {}),
+        priority: project.priority,
+        activeWork: projectWork.filter((work) => missionWorkActive(work.state)).length,
+        blockedWork: projectWork.filter((work) => work.state === "blocked").length,
+        reviewWork: projectWork.filter((work) => work.state === "review").length,
+        activeSessions: sessions.filter((session) => session.connected && names.has(session.project.toLowerCase()))
+          .length,
+        updatedAt: project.updated_at,
+        version: project.version,
+      }
+    })
+    const sessionByIdentity = new Map(sessions.map((session) => [`${session.nodeId}:${session.sessionId}`, session]))
+    const nodeNameById = new Map(nodes.map((node) => [node.id, node.name]))
+    const requestInbox = this.store.listPending().flatMap((row) => {
+      const parsed = BridgeEventSchema.safeParse(json(row.event_json))
+      if (!parsed.success || (parsed.data.type !== "permission.asked" && parsed.data.type !== "question.asked"))
+        return []
+      const event = parsed.data
+      const session = sessionByIdentity.get(`${row.node_id}:${row.session_id}`)
+      const title = event.type === "permission.asked" ? `Approval · ${clip(event.action, 100)}` : "OpenCode question"
+      const summary =
+        event.type === "permission.asked"
+          ? `${event.patterns.length} pattern${event.patterns.length === 1 ? "" : "s"} waiting for a decision`
+          : clip(event.questions[0]?.question ?? "OpenCode needs operator input", 180)
+      return [
+        {
+          key: `req_${sha256(row.identity).slice(0, 16)}`,
+          kind: event.type === "permission.asked" ? ("permission" as const) : ("question" as const),
+          state: row.state as "pending" | "dispatching" | "failed",
+          title,
+          summary,
+          project: session?.project ?? event.context?.project ?? "unknown",
+          nodeName: nodeNameById.get(row.node_id) ?? row.node_id.slice(0, 12),
+          ...(session ? { sessionKey: session.key } : {}),
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+          expiresAt: row.expires_at,
+        },
+      ]
+    })
+    const blockedInbox = workItems
+      .filter((work) => work.state === "blocked")
+      .map((work) => ({
+        key: `work_${work.id}`,
+        kind: "blocked_work" as const,
+        state: "blocked" as const,
+        title: work.title,
+        summary: work.description || "Work item is blocked and needs operator attention.",
+        project: work.projectName,
+        ...(work.sessionKey ? { sessionKey: work.sessionKey } : {}),
+        workItemId: work.id,
+        createdAt: work.createdAt,
+        updatedAt: work.updatedAt,
+      }))
+    const inboxStateRank = { failed: 0, blocked: 1, pending: 2, dispatching: 3 }
+    const inbox = [...requestInbox, ...blockedInbox]
+      .sort(
+        (left, right) => inboxStateRank[left.state] - inboxStateRank[right.state] || left.createdAt - right.createdAt,
+      )
+      .slice(0, 128)
+    const activeWork = workItems.filter((work) => missionWorkActive(work.state))
+    const missionControl = {
+      totals: {
+        projects: projects.length,
+        activeWork: activeWork.length,
+        blocked: activeWork.filter((work) => work.state === "blocked").length,
+        review: activeWork.filter((work) => work.state === "review").length,
+        inbox: inbox.length,
+      },
+      projects,
+      workItems,
+      inbox,
+    }
     return {
       generatedAt: Date.now(),
       protocolVersion: PROTOCOL_VERSION,
@@ -252,6 +367,7 @@ export class Hub implements HubView {
       },
       nodes,
       sessions,
+      missionControl,
     }
   }
 
@@ -336,7 +452,7 @@ export class Hub implements HubView {
       this.send(socket, { type: "action.ack", actionId: message.actionId })
       return
     }
-    if (!this.store.hasEvent(socket.data.nodeId, message.generation, message.seq)) {
+    if (!this.store.hasEvent(socket.data.nodeId, message.generation, message.seq, message.event.eventId)) {
       await this.handleEvent(socket.data.nodeId, message.event)
       if (message.event.type === "reconcile") {
         const { telemetry: _telemetry, ...storedEvent } = message.event

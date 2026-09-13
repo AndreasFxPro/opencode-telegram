@@ -149,6 +149,55 @@ test("dashboard CLI enables collection without hosting on node mode", async () =
   expect(secrets.dashboardToken).toBeUndefined()
 })
 
+test("Mission Control CLI manages durable projects and work state", async () => {
+  const temp = temporaryDirectory()
+  cleanup.push(temp.remove)
+  const configPath = join(temp.path, "config.json")
+  writeFileSync(
+    configPath,
+    JSON.stringify(ConfigSchema.parse({ mode: "hub", dataDir: temp.path, hub: { listen: "127.0.0.1:47620" } })),
+  )
+  const run = async (...args: string[]) => {
+    const child = Bun.spawn([process.execPath, "src/cli.ts", ...args], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, OPENCODE_TELEGRAM_CONFIG: configPath },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [output, error, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect(error).toBe("")
+    expect(exitCode).toBe(0)
+    return output
+  }
+  const project = JSON.parse(
+    await run("mission", "project", "add", "bridge", "Telegram Bridge", "--priority", "high", "--json"),
+  ) as { id: string }
+  const work = JSON.parse(
+    await run(
+      "mission",
+      "work",
+      "add",
+      "bridge",
+      "Ship control plane",
+      "--description",
+      "Durable queue",
+      "--acceptance",
+      "Visible in all views",
+      "--json",
+    ),
+  ) as { id: string }
+  expect(project.id).toStartWith("prj_")
+  expect(work.id).toStartWith("wrk_")
+  expect(await run("mission", "work", "set", work.id, "ready")).toContain(`${work.id} -> ready`)
+  expect(await run("mission", "work", "attach", work.id, "node-a:session-a")).toContain("node-a:session-a")
+  const listed = await run("mission", "work", "list", "--project", "bridge", "--state", "ready")
+  expect(listed).toContain("bridge\tShip control plane")
+})
+
 test("dashboard CLI formats an IPv6 loopback URL", async () => {
   const temp = temporaryDirectory()
   cleanup.push(temp.remove)

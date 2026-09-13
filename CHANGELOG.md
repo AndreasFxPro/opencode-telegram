@@ -4,6 +4,17 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
+### Added
+
+- Mission Control project registry, durable work states, and operator inbox in the CLI, browser dashboard, and read-only Telegram views.
+
+### Fixed
+
+- Node delivery now bounds in-flight events and results, checks socket backpressure before sending, and replays unacknowledged messages only on reconnect.
+- Retried event IDs are deduplicated in the node spool and at the hub before notification side effects, preventing repeated completion notifications from replayed events with new sequence numbers.
+- Completed command polls and retry sleeps release abort listeners; empty waiter entries are removed and shutdown settles every pending poll.
+- Queue health checks count persisted rows without loading their payloads, and delivery reads one queued payload at a time.
+
 ## [0.3.1] - 2026-09-01
 
 ### Added

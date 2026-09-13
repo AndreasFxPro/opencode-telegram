@@ -1,6 +1,16 @@
 import { Database } from "bun:sqlite"
 import { chmodSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
+import {
+  type MissionPriority,
+  type MissionProjectCreate,
+  MissionProjectCreateSchema,
+  type MissionWorkCreate,
+  MissionWorkCreateSchema,
+  type MissionWorkState,
+  MissionWorkStateSchema,
+  missionTransitionAllowed,
+} from "./mission.ts"
 import type { ActionDispatch, BridgeEvent, SessionTelemetry, TuiMetadata } from "./protocol.ts"
 import { requestIdentity } from "./protocol.ts"
 import { randomId, safeEqualHash, sha256 } from "./util.ts"
@@ -42,6 +52,37 @@ export type SessionTelemetryRow = {
   session_id: string
   payload_json: string
   updated_at: number
+}
+
+export type MissionProjectRow = {
+  id: string
+  key: string
+  name: string
+  description: string
+  repository: string | null
+  priority: MissionPriority
+  archived: number
+  created_by: string
+  created_at: number
+  updated_at: number
+  version: number
+}
+
+export type MissionWorkItemRow = {
+  id: string
+  project_id: string
+  title: string
+  description: string
+  acceptance: string
+  state: MissionWorkState
+  priority: MissionPriority
+  session_key: string | null
+  created_by: string
+  updated_by: string
+  created_at: number
+  updated_at: number
+  completed_at: number | null
+  version: number
 }
 
 const MAX_SESSION_TELEMETRY_ROWS = 128
@@ -133,6 +174,36 @@ export class HubStore {
         "UPDATE session_telemetry SET source_updated_at=COALESCE(CAST(json_extract(payload_json,'$.updatedAt') AS INTEGER),0)",
       )
     }
+    const schemaVersion = Number(
+      (this.db.query("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value,
+    )
+    if (!Number.isInteger(schemaVersion) || schemaVersion < 1) throw new Error("Invalid hub database schema version")
+    if (schemaVersion > 2) throw new Error(`Hub database schema ${schemaVersion} is newer than this binary supports`)
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS mission_projects (
+          id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          repository TEXT, priority TEXT NOT NULL DEFAULT 'normal', archived INTEGER NOT NULL DEFAULT 0,
+          created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+          CHECK(length(key) BETWEEN 1 AND 128), CHECK(length(name) BETWEEN 1 AND 256),
+          CHECK(priority IN ('urgent','high','normal','low')), CHECK(archived IN (0,1))
+        );
+        CREATE INDEX IF NOT EXISTS mission_projects_active_idx ON mission_projects(archived,updated_at DESC);
+        CREATE TABLE IF NOT EXISTS mission_work_items (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          acceptance TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'backlog', priority TEXT NOT NULL DEFAULT 'normal',
+          session_key TEXT, created_by TEXT NOT NULL, updated_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL, completed_at INTEGER, version INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY(project_id) REFERENCES mission_projects(id) ON DELETE RESTRICT,
+          CHECK(state IN ('backlog','ready','planning','running','verifying','blocked','review','completed','cancelled')),
+          CHECK(priority IN ('urgent','high','normal','low'))
+        );
+        CREATE INDEX IF NOT EXISTS mission_work_project_state_idx
+          ON mission_work_items(project_id,state,priority,updated_at DESC);
+        CREATE INDEX IF NOT EXISTS mission_work_state_idx ON mission_work_items(state,priority,updated_at DESC);
+      `)
+      if (schemaVersion < 2) this.db.query("UPDATE meta SET value='2' WHERE key='schema_version'").run()
+    })()
   }
 
   close() {
@@ -241,11 +312,11 @@ export class HubStore {
     )
   }
 
-  hasEvent(nodeId: string, generation: string, seq: number) {
+  hasEvent(nodeId: string, generation: string, seq: number, eventId = "") {
     return Boolean(
       this.db
-        .query("SELECT 1 AS found FROM events WHERE node_id=? AND generation=? AND seq=?")
-        .get(nodeId, generation, seq),
+        .query("SELECT 1 AS found FROM events WHERE (node_id=? AND generation=? AND seq=?) OR event_id=?")
+        .get(nodeId, generation, seq, eventId),
     )
   }
 
@@ -345,6 +416,122 @@ export class HubStore {
 
   cleanupTelemetry(now: number, retentionMs: number) {
     this.db.query("DELETE FROM session_telemetry WHERE updated_at<?").run(now - retentionMs)
+  }
+
+  createMissionProject(input: MissionProjectCreate, actor = "cli") {
+    const project = MissionProjectCreateSchema.parse(input)
+    if (this.getMissionProject(project.key)) throw new Error(`Project '${project.key}' already exists`)
+    const id = randomId("prj", 12)
+    const now = Date.now()
+    this.db
+      .query(
+        "INSERT INTO mission_projects(id,key,name,description,repository,priority,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        id,
+        project.key,
+        project.name,
+        project.description,
+        project.repository ?? null,
+        project.priority,
+        actor,
+        now,
+        now,
+      )
+    return this.getMissionProject(id) as MissionProjectRow
+  }
+
+  getMissionProject(idOrKey: string) {
+    return this.db
+      .query("SELECT * FROM mission_projects WHERE id=? OR key=?")
+      .get(idOrKey, idOrKey) as MissionProjectRow | null
+  }
+
+  listMissionProjects(includeArchived = false) {
+    return this.db
+      .query(
+        `SELECT * FROM mission_projects${includeArchived ? "" : " WHERE archived=0"} ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,updated_at DESC LIMIT 128`,
+      )
+      .all() as MissionProjectRow[]
+  }
+
+  archiveMissionProject(idOrKey: string, expectedVersion?: number) {
+    const project = this.getMissionProject(idOrKey)
+    if (!project) throw new Error("Project not found")
+    const result = this.db
+      .query("UPDATE mission_projects SET archived=1,updated_at=?,version=version+1 WHERE id=? AND version=?")
+      .run(Date.now(), project.id, expectedVersion ?? project.version)
+    if (result.changes !== 1) throw new Error("Project changed concurrently")
+    return this.getMissionProject(project.id) as MissionProjectRow
+  }
+
+  createMissionWorkItem(input: MissionWorkCreate, actor = "cli") {
+    const work = MissionWorkCreateSchema.parse(input)
+    const project = this.getMissionProject(work.projectId)
+    if (!project || project.archived) throw new Error("Active project not found")
+    const id = randomId("wrk", 12)
+    const now = Date.now()
+    this.db
+      .query(
+        "INSERT INTO mission_work_items(id,project_id,title,description,acceptance,state,priority,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,'backlog',?,?,?,?,?)",
+      )
+      .run(id, project.id, work.title, work.description, work.acceptance, work.priority, actor, actor, now, now)
+    return this.getMissionWorkItem(id) as MissionWorkItemRow
+  }
+
+  getMissionWorkItem(id: string) {
+    return this.db.query("SELECT * FROM mission_work_items WHERE id=?").get(id) as MissionWorkItemRow | null
+  }
+
+  listMissionWorkItems(filters: { projectId?: string; state?: MissionWorkState; activeOnly?: boolean } = {}) {
+    const clauses: string[] = []
+    const values: Array<string | number> = []
+    if (filters.projectId) {
+      const project = this.getMissionProject(filters.projectId)
+      if (!project) return []
+      clauses.push("project_id=?")
+      values.push(project.id)
+    }
+    if (filters.state) {
+      clauses.push("state=?")
+      values.push(MissionWorkStateSchema.parse(filters.state))
+    } else if (filters.activeOnly) clauses.push("state NOT IN ('completed','cancelled')")
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""
+    return this.db
+      .query(
+        `SELECT * FROM mission_work_items${where} ORDER BY CASE state WHEN 'blocked' THEN 0 WHEN 'review' THEN 1 WHEN 'verifying' THEN 2 WHEN 'running' THEN 3 WHEN 'planning' THEN 4 WHEN 'ready' THEN 5 WHEN 'backlog' THEN 6 WHEN 'completed' THEN 7 ELSE 8 END,CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,updated_at DESC LIMIT 256`,
+      )
+      .all(...values) as MissionWorkItemRow[]
+  }
+
+  transitionMissionWorkItem(id: string, nextState: MissionWorkState, actor = "cli", expectedVersion?: number) {
+    const work = this.getMissionWorkItem(id)
+    if (!work) throw new Error("Work item not found")
+    const next = MissionWorkStateSchema.parse(nextState)
+    if (!missionTransitionAllowed(work.state, next))
+      throw new Error(`Cannot transition work item from ${work.state} to ${next}`)
+    if (work.state === next) return work
+    const now = Date.now()
+    const result = this.db
+      .query(
+        "UPDATE mission_work_items SET state=?,updated_by=?,updated_at=?,completed_at=?,version=version+1 WHERE id=? AND version=?",
+      )
+      .run(next, actor, now, next === "completed" ? now : null, id, expectedVersion ?? work.version)
+    if (result.changes !== 1) throw new Error("Work item changed concurrently")
+    return this.getMissionWorkItem(id) as MissionWorkItemRow
+  }
+
+  attachMissionWorkItem(id: string, sessionKey: string | undefined, actor = "cli", expectedVersion?: number) {
+    if (sessionKey && (sessionKey.length > 512 || /[\r\n\0]/.test(sessionKey))) throw new Error("Invalid session key")
+    const work = this.getMissionWorkItem(id)
+    if (!work) throw new Error("Work item not found")
+    const result = this.db
+      .query(
+        "UPDATE mission_work_items SET session_key=?,updated_by=?,updated_at=?,version=version+1 WHERE id=? AND version=?",
+      )
+      .run(sessionKey ?? null, actor, Date.now(), id, expectedVersion ?? work.version)
+    if (result.changes !== 1) throw new Error("Work item changed concurrently")
+    return this.getMissionWorkItem(id) as MissionWorkItemRow
   }
 
   upsertPending(nodeId: string, event: BridgeEvent & { requestId: string }) {
@@ -620,6 +807,7 @@ export class NodeStore {
     chmodSync(path, 0o600)
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS spool(seq INTEGER PRIMARY KEY AUTOINCREMENT,payload_json TEXT NOT NULL,kind TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS spool_event_id_idx ON spool(json_extract(payload_json,'$.eventId'));
       CREATE TABLE IF NOT EXISTS command_inbox(action_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,payload_json TEXT NOT NULL,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS result_outbox(action_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -638,6 +826,10 @@ export class NodeStore {
       "tui.disconnected",
     ].includes(event.type)
     return this.db.transaction(() => {
+      if (
+        this.db.query("SELECT 1 FROM spool WHERE json_extract(payload_json,'$.eventId')=? LIMIT 1").get(event.eventId)
+      )
+        return true
       if (event.type === "reconcile")
         this.db
           .query("DELETE FROM spool WHERE kind='reconcile' AND json_extract(payload_json,'$.instanceId')=?")
@@ -659,8 +851,11 @@ export class NodeStore {
       return true
     })()
   }
-  pending() {
-    return this.db.query("SELECT seq,payload_json FROM spool ORDER BY seq ASC").all() as Array<{
+  pendingCount() {
+    return (this.db.query("SELECT COUNT(*) AS count FROM spool").get() as { count: number }).count
+  }
+  pending(limit = -1) {
+    return this.db.query("SELECT seq,payload_json FROM spool ORDER BY seq ASC LIMIT ?").all(limit) as Array<{
       seq: number
       payload_json: string
     }>
@@ -698,8 +893,10 @@ export class NodeStore {
       this.db.query("DELETE FROM command_inbox WHERE action_id=?").run(actionId)
     })()
   }
-  results() {
-    return this.db.query("SELECT action_id,payload_json FROM result_outbox ORDER BY created_at").all() as Array<{
+  results(limit = -1) {
+    return this.db
+      .query("SELECT action_id,payload_json FROM result_outbox ORDER BY created_at LIMIT ?")
+      .all(limit) as Array<{
       action_id: string
       payload_json: string
     }>
