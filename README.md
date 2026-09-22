@@ -169,7 +169,9 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before exposing a hub.
 
 See [`config.example.json`](config.example.json) and [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Secrets are stored separately and are never printed by `config show`.
 
-Defaults are privacy-conscious: no final response preview, no arbitrary prompting, no subagent completion notifications, and a 20-second completion threshold.
+Completion notifications use a detailed layout: project, task title, branch, node, readable duration, final response, session-wide change totals, reported verification, follow-ups, and session ID. Fields without available data are omitted. Verification and follow-up sections are extracted from explicit headings in the final response; pending/in-progress session todos also appear as follow-ups. Test success is never inferred from the session finishing. Change totals cover the whole session, not just the latest turn.
+
+Final-response previews are enabled by default, limited to 1024 characters (`notifications.previewMaxChars`). Set `notifications.includeFinalPreview` to `false` to hide result, verification, and follow-up text. Existing configurations with an explicit `false` retain that setting; set it to `true` to enable the detailed report. Branch, tmux, agent, and model visibility still follow their individual notification settings. Defaults retain a 20-second completion threshold, no arbitrary prompting, and no subagent completion notifications.
 
 ## Compatibility
 

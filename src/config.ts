@@ -69,8 +69,8 @@ export const ConfigSchema = z.object({
       includeTmux: z.boolean().default(true),
       includeModel: z.boolean().default(true),
       includeAgent: z.boolean().default(true),
-      includeFinalPreview: z.boolean().default(false),
-      previewMaxChars: z.number().int().min(20).max(1024).default(180),
+      includeFinalPreview: z.boolean().default(true),
+      previewMaxChars: z.number().int().min(20).max(1024).default(1024),
     })
     .default({
       permission: true,
@@ -82,8 +82,8 @@ export const ConfigSchema = z.object({
       includeTmux: true,
       includeModel: true,
       includeAgent: true,
-      includeFinalPreview: false,
-      previewMaxChars: 180,
+      includeFinalPreview: true,
+      previewMaxChars: 1024,
     }),
 })
 export type Config = z.infer<typeof ConfigSchema>

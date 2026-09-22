@@ -33,7 +33,7 @@ See [`config.example.json`](../config.example.json). `secrets.json` is generated
 - Completion: enabled after 20 seconds.
 - Root sessions only for completion.
 - Branch/model/agent metadata: enabled when natively available.
-- Final preview: disabled.
+- Final preview: enabled, up to 1024 characters. Existing explicit `notifications.includeFinalPreview: false` settings are preserved; set it to `true` to show result, reported verification, and follow-up text.
 - Remote prompt: disabled and not exposed by the current alpha CLI.
 
 ## Dashboard

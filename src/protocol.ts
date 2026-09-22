@@ -108,6 +108,15 @@ const ExecutionSchema = BaseEventSchema.extend({
   durationMs: z.number().int().nonnegative().optional(),
   error: z.string().max(4096).optional(),
   finalPreview: z.string().max(1024).optional(),
+  verification: z.string().max(500).optional(),
+  followUp: z.string().max(500).optional(),
+  changes: z
+    .object({
+      files: z.number().int().nonnegative(),
+      additions: z.number().int().nonnegative(),
+      deletions: z.number().int().nonnegative(),
+    })
+    .optional(),
 })
 
 const TuiDisconnectedSchema = BaseEventSchema.extend({

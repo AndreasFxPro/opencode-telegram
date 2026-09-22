@@ -165,6 +165,63 @@ function eventContext(event: BridgeEvent) {
   return parts.join("\n")
 }
 
+export function renderExecution(
+  event: Extract<
+    BridgeEvent,
+    { type: "execution.started" | "execution.succeeded" | "execution.failed" | "execution.stuck" }
+  >,
+  notifications: Config["notifications"],
+) {
+  const heading =
+    event.type === "execution.succeeded"
+      ? "✅ <b>OpenCode finished</b>"
+      : event.type === "execution.stuck"
+        ? "⌛ <b>OpenCode needs attention</b>"
+        : "❌ <b>OpenCode failed</b>"
+  const context = event.context
+  const project =
+    context?.project ?? event.location.directory.split("/").filter(Boolean).at(-1) ?? event.location.directory
+  const lines = [heading, "", `📁 Project: <code>${escapeHtml(clip(project, 100))}</code>`]
+  if (context?.title) lines.push(`📝 Task: ${escapeHtml(clip(context.title, 200))}`)
+  if (notifications.includeBranch && context?.branch)
+    lines.push(`🌿 Branch: <code>${escapeHtml(clip(context.branch, 80))}</code>`)
+  if (context?.host) lines.push(`🖥 Node: <code>${escapeHtml(clip(context.host, 80))}</code>`)
+  if (notifications.includeTmux && context?.tmux)
+    lines.push(`🪟 Tmux: <code>${escapeHtml(clip(context.tmux, 80))}</code>`)
+  const model = [notifications.includeAgent && context?.agent, notifications.includeModel && context?.model]
+    .filter(Boolean)
+    .join(" · ")
+  if (model) lines.push(`🤖 ${escapeHtml(clip(model, 120))}`)
+  if (event.durationMs !== undefined) {
+    const seconds = Math.round(event.durationMs / 1000)
+    const duration = [
+      seconds >= 3600 ? `${Math.floor(seconds / 3600)}h` : "",
+      seconds >= 60 ? `${Math.floor(seconds / 60) % 60}m` : "",
+      `${seconds % 60}s`,
+    ]
+      .filter(Boolean)
+      .join(" ")
+    lines.push(`⏱ Duration: ${duration}`)
+  }
+  if (notifications.includeFinalPreview && event.finalPreview)
+    lines.push("", "📋 <b>Result</b>", escapeHtml(clip(event.finalPreview, notifications.previewMaxChars)))
+  if (event.changes) {
+    const { files, additions, deletions } = event.changes
+    lines.push(
+      "",
+      "📄 <b>Changes (session total)</b>",
+      `${files} ${files === 1 ? "file" : "files"} changed · +${additions} / −${deletions} lines`,
+    )
+  }
+  if (notifications.includeFinalPreview && event.verification)
+    lines.push("", "🧪 <b>Verification (reported by OpenCode)</b>", escapeHtml(clip(event.verification, 500)))
+  if (notifications.includeFinalPreview && event.followUp)
+    lines.push("", "⚠️ <b>Follow-up</b>", escapeHtml(clip(event.followUp, 500)))
+  if (event.error) lines.push("", "❌ <b>Error</b>", `<code>${escapeHtml(clip(event.error, 500))}</code>`)
+  if (event.sessionId) lines.push("", `🔑 <code>${escapeHtml(clip(event.sessionId, 256))}</code>`)
+  return lines.join("\n")
+}
+
 export function renderPermission(event: PermissionAsked, status?: string) {
   const actionable = permissionActionable(event)
   const patterns = event.patterns
@@ -391,17 +448,7 @@ export class TelegramGateway {
       return
     if (event.type === "execution.failed" && !this.config.notifications.error) return
     if (event.type === "execution.started") return
-    const heading =
-      event.type === "execution.succeeded"
-        ? "✅ <b>OpenCode finished</b>"
-        : event.type === "execution.stuck"
-          ? "⌛ <b>OpenCode needs attention</b>"
-          : "❌ <b>OpenCode failed</b>"
-    let text = `${heading}\n\n${eventContext(event)}`
-    if (event.durationMs !== undefined) text += `\n⏱ ${Math.round(event.durationMs / 1000)}s`
-    if (event.error) text += `\n\n<code>${escapeHtml(clip(event.error, 900))}</code>`
-    if (this.config.notifications.includeFinalPreview && event.finalPreview)
-      text += `\n\n${escapeHtml(clip(event.finalPreview, this.config.notifications.previewMaxChars))}`
+    const text = renderExecution(event, this.config.notifications)
     for (const auth of this.config.telegram.authorizedChats) {
       if (this.store.isMuted("chat", String(auth.id))) continue
       await this.api("sendMessage", {

@@ -4,6 +4,17 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-22
+
+### Added
+
+- Detailed completion notifications with task, branch, node, readable duration, final response, session-wide change totals, reported verification, follow-ups, and full session ID.
+- Completion events now collect current final-response text and unfinished session todos, excluding reasoning and earlier execution responses.
+
+### Changed
+
+- Final-response previews default to enabled with a 1024-character limit. Existing explicit preview and metadata visibility settings are preserved.
+
 ## [0.4.0] - 2026-09-13
 
 ### Added

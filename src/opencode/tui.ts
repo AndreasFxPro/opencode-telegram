@@ -13,6 +13,7 @@ import {
 import { clip, randomId, sleep } from "../util.ts"
 import { VERSION } from "../version.ts"
 import { OpenCodeAdapter } from "./adapter.ts"
+import { executionDetails } from "./execution.ts"
 import { boundedTelemetry, sessionTelemetry } from "./telemetry.ts"
 
 function tmuxMetadata() {
@@ -421,6 +422,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
             rootSessionId: rootId,
             location: { directory: api.state.session.get(rootId)?.directory ?? api.state.path.directory },
             durationMs: Date.now() - execution.startedAt,
+            ...executionDetails(api, rootId, execution.startedAt),
           })
         }
       }
@@ -440,6 +442,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
         location: { directory: api.state.session.get(rootId)?.directory ?? api.state.path.directory },
         ...(execution ? { durationMs: Date.now() - execution.startedAt } : {}),
         error: "OpenCode session failed. See the originating TUI for private details.",
+        ...executionDetails(api, rootId),
       })
     }),
     api.event.on("message.part.updated", (event) => {
@@ -554,6 +557,7 @@ async function setup(api: TuiPluginApi, options?: Record<string, unknown>) {
         rootSessionId: rootId,
         location: { directory: api.state.session.get(rootId)?.directory ?? api.state.path.directory },
         durationMs: now - execution.startedAt,
+        ...executionDetails(api, rootId),
       })
     }
   }, 30_000)
