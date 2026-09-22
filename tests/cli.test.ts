@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { ConfigSchema, SecretsSchema } from "../src/config.ts"
 import { HubStore } from "../src/store.ts"
+import { VERSION } from "../src/version.ts"
 import { temporaryDirectory, testSecrets } from "./helpers.ts"
 
 const cleanup: Array<() => void> = []
@@ -35,9 +36,9 @@ test("node create prints a single-command installer with the one-time token", as
   expect(exitCode).toBe(0)
   expect(output).toContain("Install and enroll machine-a:")
   expect(output).toContain(
-    "curl -fsSL 'https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/v0.4.0/install.sh' -o \"$installer\"",
+    `curl -fsSL 'https://raw.githubusercontent.com/AndreasFxPro/opencode-telegram/v${VERSION}/install.sh' -o "$installer"`,
   )
-  expect(output).toContain("OPENCODE_TELEGRAM_VERSION='v0.4.0' OPENCODE_TELEGRAM_ENROLLMENT_TOKEN='oct_join_")
+  expect(output).toContain(`OPENCODE_TELEGRAM_VERSION='v${VERSION}' OPENCODE_TELEGRAM_ENROLLMENT_TOKEN='oct_join_`)
   expect(output).toContain("bash \"$installer\" setup node --hub 'https://hub.example.com'")
   expect(output).not.toContain("--token")
 })

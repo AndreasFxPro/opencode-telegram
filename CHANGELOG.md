@@ -4,7 +4,9 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 
 ## [Unreleased]
 
-## [0.4.1] - 2026-09-22
+## [0.4.2] - 2026-09-22
+
+Includes the detailed notifications prepared for v0.4.1, which did not publish release assets because its version-sensitive CLI test failed.
 
 ### Added
 
@@ -14,6 +16,10 @@ All notable changes follow Keep a Changelog. This project uses semantic versioni
 ### Changed
 
 - Final-response previews default to enabled with a 1024-character limit. Existing explicit preview and metadata visibility settings are preserved.
+
+### Fixed
+
+- Node installer command tests now follow the current release version rather than a hardcoded tag.
 
 ## [0.4.0] - 2026-09-13
 
